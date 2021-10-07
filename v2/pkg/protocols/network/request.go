@@ -13,13 +13,15 @@ import (
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/expressions"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/interactsh"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/replacer"
 )
 
 var _ protocols.Request = &Request{}
 
 // ExecuteWithResults executes the protocol requests and returns results instead of writing them.
-func (r *Request) ExecuteWithResults(input string, metadata, previous output.InternalEvent, callback protocols.OutputEventCallback) error {
+func (r *Request) ExecuteWithResults(input string, metadata /*TODO review unused parameter*/, previous output.InternalEvent, callback protocols.OutputEventCallback) error {
 	address, err := getAddress(input)
 	if err != nil {
 		r.options.Output.Request(r.options.TemplateID, input, "network", err)
@@ -36,8 +38,7 @@ func (r *Request) ExecuteWithResults(input string, metadata, previous output.Int
 			actualAddress = net.JoinHostPort(actualAddress, kv.port)
 		}
 
-		err = r.executeAddress(actualAddress, address, input, kv.tls, previous, callback)
-		if err != nil {
+		if err := r.executeAddress(actualAddress, address, input, kv.tls, previous, callback); err != nil {
 			gologger.Verbose().Label("ERR").Msgf("Could not make network request for %s: %s\n", actualAddress, err)
 			continue
 		}
@@ -54,6 +55,28 @@ func (r *Request) executeAddress(actualAddress, address, input string, shouldUse
 		return err
 	}
 
+	if r.generator != nil {
+		iterator := r.generator.NewIterator()
+
+		for {
+			value, ok := iterator.Value()
+			if !ok {
+				break
+			}
+			if err := r.executeRequestWithPayloads(actualAddress, address, input, shouldUseTLS, value, previous, callback); err != nil {
+				return err
+			}
+		}
+	} else {
+		value := make(map[string]interface{})
+		if err := r.executeRequestWithPayloads(actualAddress, address, input, shouldUseTLS, value, previous, callback); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Request) executeRequestWithPayloads(actualAddress, address, input string, shouldUseTLS bool, payloads map[string]interface{}, previous output.InternalEvent, callback protocols.OutputEventCallback) error {
 	var (
 		hostname string
 		conn     net.Conn
@@ -77,6 +100,12 @@ func (r *Request) executeAddress(actualAddress, address, input string, shouldUse
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(time.Duration(r.options.Options.Timeout) * time.Second))
 
+	hasInteractMarkers := interactsh.HasMatchers(r.CompiledOperators)
+	var interactURL string
+	if r.options.Interactsh != nil && hasInteractMarkers {
+		interactURL = r.options.Interactsh.URL()
+	}
+
 	responseBuilder := &strings.Builder{}
 	reqBuilder := &strings.Builder{}
 
@@ -88,6 +117,9 @@ func (r *Request) executeAddress(actualAddress, address, input string, shouldUse
 		case "hex":
 			data, err = hex.DecodeString(input.Data)
 		default:
+			if interactURL != "" {
+				input.Data = r.options.Interactsh.ReplaceMarkers(input.Data, interactURL)
+			}
 			data = []byte(input.Data)
 		}
 		if err != nil {
@@ -96,10 +128,16 @@ func (r *Request) executeAddress(actualAddress, address, input string, shouldUse
 			return errors.Wrap(err, "could not write request to server")
 		}
 		reqBuilder.Grow(len(input.Data))
-		reqBuilder.WriteString(input.Data)
 
-		_, err = conn.Write(data)
-		if err != nil {
+		finalData, dataErr := expressions.EvaluateByte(data, payloads)
+		if dataErr != nil {
+			r.options.Output.Request(r.options.TemplateID, address, "network", dataErr)
+			r.options.Progress.IncrementFailedRequestsBy(1)
+			return errors.Wrap(dataErr, "could not evaluate template expressions")
+		}
+		reqBuilder.Write(finalData)
+
+		if _, err := conn.Write(finalData); err != nil {
 			r.options.Output.Request(r.options.TemplateID, address, "network", err)
 			r.options.Progress.IncrementFailedRequestsBy(1)
 			return errors.Wrap(err, "could not write request to server")
@@ -109,16 +147,27 @@ func (r *Request) executeAddress(actualAddress, address, input string, shouldUse
 			buffer := make([]byte, input.Read)
 			n, _ := conn.Read(buffer)
 			responseBuilder.Write(buffer[:n])
+
+			bufferStr := string(buffer[:n])
 			if input.Name != "" {
-				inputEvents[input.Name] = string(buffer[:n])
+				inputEvents[input.Name] = bufferStr
+			}
+
+			// Run any internal extractors for the request here and add found values to map.
+			if r.CompiledOperators != nil {
+				values := r.CompiledOperators.ExecuteInternalExtractors(map[string]interface{}{input.Name: bufferStr}, r.Extract)
+				for k, v := range values {
+					payloads[k] = v
+				}
 			}
 		}
 	}
 	r.options.Progress.IncrementRequests()
 
 	if r.options.Options.Debug || r.options.Options.DebugRequests {
+		requestOutput := reqBuilder.String()
 		gologger.Info().Str("address", actualAddress).Msgf("[%s] Dumped Network request for %s", r.options.TemplateID, actualAddress)
-		gologger.Print().Msgf("%s", reqBuilder.String())
+		gologger.Print().Msgf("%s\nHex: %s", requestOutput, hex.EncodeToString([]byte(requestOutput)))
 	}
 
 	r.options.Output.Request(r.options.TemplateID, actualAddress, "network", err)
@@ -137,12 +186,16 @@ func (r *Request) executeAddress(actualAddress, address, input string, shouldUse
 	responseBuilder.Write(final[:n])
 
 	if r.options.Options.Debug || r.options.Options.DebugResponse {
+		responseOutput := responseBuilder.String()
 		gologger.Debug().Msgf("[%s] Dumped Network response for %s", r.options.TemplateID, actualAddress)
-		gologger.Print().Msgf("%s", responseBuilder.String())
+		gologger.Print().Msgf("%s\nHex: %s", responseOutput, hex.EncodeToString([]byte(responseOutput)))
 	}
 	outputEvent := r.responseToDSLMap(reqBuilder.String(), string(final[:n]), responseBuilder.String(), input, actualAddress)
 	outputEvent["ip"] = r.dialer.GetDialedIP(hostname)
 	for k, v := range previous {
+		outputEvent[k] = v
+	}
+	for k, v := range payloads {
 		outputEvent[k] = v
 	}
 	for k, v := range inputEvents {
@@ -150,14 +203,25 @@ func (r *Request) executeAddress(actualAddress, address, input string, shouldUse
 	}
 
 	event := &output.InternalWrappedEvent{InternalEvent: outputEvent}
-	if r.CompiledOperators != nil {
-		result, ok := r.CompiledOperators.Execute(outputEvent, r.Match, r.Extract)
-		if ok && result != nil {
-			event.OperatorsResult = result
-			event.Results = r.MakeResultEvent(event)
+	if interactURL == "" {
+		if r.CompiledOperators != nil {
+			result, ok := r.CompiledOperators.Execute(outputEvent, r.Match, r.Extract)
+			if ok && result != nil {
+				event.OperatorsResult = result
+				event.OperatorsResult.PayloadValues = payloads
+				event.Results = r.MakeResultEvent(event)
+			}
 		}
+		callback(event)
+	} else if r.options.Interactsh != nil {
+		r.options.Interactsh.RequestEvent(interactURL, &interactsh.RequestData{
+			MakeResultFunc: r.MakeResultEvent,
+			Event:          event,
+			Operators:      r.CompiledOperators,
+			MatchFunc:      r.Match,
+			ExtractFunc:    r.Extract,
+		})
 	}
-	callback(event)
 	return nil
 }
 

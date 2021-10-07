@@ -5,11 +5,13 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/gologger/formatter"
 	"github.com/projectdiscovery/gologger/levels"
+	"github.com/projectdiscovery/nuclei/v2/pkg/catalog/config"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/protocolinit"
 	"github.com/projectdiscovery/nuclei/v2/pkg/types"
 )
@@ -19,6 +21,11 @@ func ParseOptions(options *types.Options) {
 	// Check if stdin pipe was given
 	options.Stdin = hasStdin()
 
+	// if VerboseVerbose is set, it implicitly enables the Verbose option as well
+	if options.VerboseVerbose {
+		options.Verbose = true
+	}
+
 	// Read the inputs and configure the logging
 	configureOutput(options)
 
@@ -26,15 +33,15 @@ func ParseOptions(options *types.Options) {
 	showBanner()
 
 	if options.Version {
-		gologger.Info().Msgf("Current Version: %s\n", Version)
+		gologger.Info().Msgf("Current Version: %s\n", config.Version)
 		os.Exit(0)
 	}
 	if options.TemplatesVersion {
-		config, err := readConfiguration()
+		configuration, err := config.ReadConfiguration()
 		if err != nil {
 			gologger.Fatal().Msgf("Could not read template configuration: %s\n", err)
 		}
-		gologger.Info().Msgf("Current nuclei-templates version: %s (%s)\n", config.CurrentVersion, config.TemplatesDirectory)
+		gologger.Info().Msgf("Current nuclei-templates version: %s (%s)\n", configuration.TemplateVersion, configuration.TemplatesDirectory)
 		os.Exit(0)
 	}
 
@@ -75,28 +82,22 @@ func hasStdin() bool {
 
 // validateOptions validates the configuration options passed
 func validateOptions(options *types.Options) error {
-	// Both verbose and silent flags were used
 	if options.Verbose && options.Silent {
 		return errors.New("both verbose and silent mode specified")
 	}
 
-	if !options.TemplateList {
-		// Check if a list of templates was provided and it exists
-		if len(options.Templates) == 0 && !options.NewTemplates && len(options.Workflows) == 0 && len(options.Tags) == 0 && !options.UpdateTemplates {
-			return errors.New("no template/templates provided")
-		}
-	}
-
-	// Validate proxy options if provided
-	err := validateProxyURL(options.ProxyURL, "invalid http proxy format (It should be http://username:password@host:port)")
-	if err != nil {
+	if err := validateProxyURL(options.ProxyURL, "invalid http proxy format (It should be http://username:password@host:port)"); err != nil {
 		return err
 	}
 
-	err = validateProxyURL(options.ProxySocksURL, "invalid socks proxy format (It should be socks5://username:password@host:port)")
-	if err != nil {
+	if err := validateProxyURL(options.ProxySocksURL, "invalid socks proxy format (It should be socks5://username:password@host:port)"); err != nil {
 		return err
 	}
+
+	if options.Validate {
+		validateTemplatePaths(options.TemplatesDirectory, options.Templates, options.Workflows)
+	}
+
 	return nil
 }
 
@@ -113,10 +114,10 @@ func isValidURL(urlString string) bool {
 	return err == nil
 }
 
-// configureOutput configures the output on the screen
+// configureOutput configures the output logging levels to be displayed on the screen
 func configureOutput(options *types.Options) {
 	// If the user desires verbose output, show verbose output
-	if options.Verbose {
+	if options.Verbose || options.VerboseVerbose {
 		gologger.DefaultLogger.SetMaxLevel(levels.LevelVerbose)
 	}
 	if options.Debug {
@@ -152,6 +153,24 @@ func loadResolvers(options *types.Options) {
 			options.InternalResolversList = append(options.InternalResolversList, part)
 		} else {
 			options.InternalResolversList = append(options.InternalResolversList, part+":53")
+		}
+	}
+}
+
+func validateTemplatePaths(templatesDirectory string, templatePaths, workflowPaths []string) {
+	allGivenTemplatePaths := append(templatePaths, workflowPaths...)
+
+	for _, templatePath := range allGivenTemplatePaths {
+		if templatesDirectory != templatePath && filepath.IsAbs(templatePath) {
+			fileInfo, err := os.Stat(templatePath)
+			if err == nil && fileInfo.IsDir() {
+				relativizedPath, err2 := filepath.Rel(templatesDirectory, templatePath)
+				if err2 != nil || (len(relativizedPath) >= 2 && relativizedPath[:2] == "..") {
+					gologger.Warning().Msgf("The given path (%s) is outside the default template directory path (%s)! "+
+						"Referenced sub-templates with relative paths in workflows will be resolved against the default template directory.", templatePath, templatesDirectory)
+					break
+				}
+			}
 		}
 	}
 }

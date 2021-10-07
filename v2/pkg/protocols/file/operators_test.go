@@ -3,12 +3,15 @@ package file
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/projectdiscovery/nuclei/v2/internal/testutils"
+	"github.com/projectdiscovery/nuclei/v2/pkg/model"
+	"github.com/projectdiscovery/nuclei/v2/pkg/model/types/severity"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/extractors"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/matchers"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
-	"github.com/stretchr/testify/require"
 )
 
 func TestResponseToDSLMap(t *testing.T) {
@@ -25,14 +28,14 @@ func TestResponseToDSLMap(t *testing.T) {
 	}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
-		Info: map[string]interface{}{"severity": "low", "name": "test"},
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
 	err := request.Compile(executerOpts)
 	require.Nil(t, err, "could not compile file request")
 
 	resp := "test-data\r\n"
 	event := request.responseToDSLMap(resp, "one.one.one.one", "one.one.one.one")
-	require.Len(t, event, 5, "could not get correct number of items in dsl map")
+	require.Len(t, event, 6, "could not get correct number of items in dsl map")
 	require.Equal(t, resp, event["raw"], "could not get correct resp")
 }
 
@@ -50,14 +53,14 @@ func TestFileOperatorMatch(t *testing.T) {
 	}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
-		Info: map[string]interface{}{"severity": "low", "name": "test"},
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
 	err := request.Compile(executerOpts)
 	require.Nil(t, err, "could not compile file request")
 
 	resp := "test-data\r\n1.1.1.1\r\n"
 	event := request.responseToDSLMap(resp, "one.one.one.one", "one.one.one.one")
-	require.Len(t, event, 5, "could not get correct number of items in dsl map")
+	require.Len(t, event, 6, "could not get correct number of items in dsl map")
 	require.Equal(t, resp, event["raw"], "could not get correct resp")
 
 	t.Run("valid", func(t *testing.T) {
@@ -115,14 +118,14 @@ func TestFileOperatorExtract(t *testing.T) {
 	}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
-		Info: map[string]interface{}{"severity": "low", "name": "test"},
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
 	err := request.Compile(executerOpts)
 	require.Nil(t, err, "could not compile file request")
 
 	resp := "test-data\r\n1.1.1.1\r\n"
 	event := request.responseToDSLMap(resp, "one.one.one.one", "one.one.one.one")
-	require.Len(t, event, 5, "could not get correct number of items in dsl map")
+	require.Len(t, event, 6, "could not get correct number of items in dsl map")
 	require.Equal(t, resp, event["raw"], "could not get correct resp")
 
 	t.Run("extract", func(t *testing.T) {
@@ -180,14 +183,14 @@ func TestFileMakeResult(t *testing.T) {
 	}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
-		Info: map[string]interface{}{"severity": "low", "name": "test"},
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
 	err := request.Compile(executerOpts)
 	require.Nil(t, err, "could not compile file request")
 
 	resp := "test-data\r\n1.1.1.1\r\n"
 	event := request.responseToDSLMap(resp, "one.one.one.one", "one.one.one.one")
-	require.Len(t, event, 5, "could not get correct number of items in dsl map")
+	require.Len(t, event, 6, "could not get correct number of items in dsl map")
 	require.Equal(t, resp, event["raw"], "could not get correct resp")
 
 	finalEvent := &output.InternalWrappedEvent{InternalEvent: event}

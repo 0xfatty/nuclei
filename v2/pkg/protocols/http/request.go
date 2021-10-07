@@ -13,15 +13,18 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"github.com/remeh/sizedwaitgroup"
+	"go.uber.org/multierr"
+
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/generators"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/interactsh"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/tostring"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/http/httpclientpool"
 	"github.com/projectdiscovery/rawhttp"
-	"github.com/remeh/sizedwaitgroup"
-	"go.uber.org/multierr"
+	"github.com/projectdiscovery/stringsutil"
 )
 
 const defaultMaxWorkers = 150
@@ -33,7 +36,7 @@ func (r *Request) executeRaceRequest(reqURL string, previous output.InternalEven
 	// Requests within race condition should be dumped once and the output prefilled to allow DSL language to work
 	// This will introduce a delay and will populate in hacky way the field "request" of outputEvent
 	generator := r.newGenerator()
-	requestForDump, err := generator.Make(reqURL, nil)
+	requestForDump, err := generator.Make(reqURL, nil, "")
 	if err != nil {
 		return err
 	}
@@ -51,7 +54,7 @@ func (r *Request) executeRaceRequest(reqURL string, previous output.InternalEven
 	// Pre-Generate requests
 	for i := 0; i < r.RaceNumberRequests; i++ {
 		generator := r.newGenerator()
-		request, err := generator.Make(reqURL, nil)
+		request, err := generator.Make(reqURL, nil, "")
 		if err != nil {
 			return err
 		}
@@ -65,7 +68,7 @@ func (r *Request) executeRaceRequest(reqURL string, previous output.InternalEven
 		wg.Add(1)
 		go func(httpRequest *generatedRequest) {
 			defer wg.Done()
-			err := r.executeRequest(reqURL, httpRequest, previous, callback, 0)
+			err := r.executeRequest(reqURL, httpRequest, previous, false, callback, 0)
 			mutex.Lock()
 			if err != nil {
 				requestErr = multierr.Append(requestErr, err)
@@ -80,7 +83,7 @@ func (r *Request) executeRaceRequest(reqURL string, previous output.InternalEven
 }
 
 // executeRaceRequest executes parallel requests for a template
-func (r *Request) executeParallelHTTP(reqURL string, dynamicValues, previous output.InternalEvent, callback protocols.OutputEventCallback) error {
+func (r *Request) executeParallelHTTP(reqURL string, dynamicValues output.InternalEvent, callback protocols.OutputEventCallback) error {
 	generator := r.newGenerator()
 
 	// Workers that keeps enqueuing new requests
@@ -90,7 +93,7 @@ func (r *Request) executeParallelHTTP(reqURL string, dynamicValues, previous out
 	var requestErr error
 	mutex := &sync.Mutex{}
 	for {
-		request, err := generator.Make(reqURL, dynamicValues)
+		request, err := generator.Make(reqURL, dynamicValues, "")
 		if err == io.EOF {
 			break
 		}
@@ -103,7 +106,9 @@ func (r *Request) executeParallelHTTP(reqURL string, dynamicValues, previous out
 			defer swg.Done()
 
 			r.options.RateLimiter.Take()
-			err := r.executeRequest(reqURL, httpRequest, previous, callback, 0)
+
+			previous := make(map[string]interface{})
+			err := r.executeRequest(reqURL, httpRequest, previous, false, callback, 0)
 			mutex.Lock()
 			if err != nil {
 				requestErr = multierr.Append(requestErr, err)
@@ -116,7 +121,7 @@ func (r *Request) executeParallelHTTP(reqURL string, dynamicValues, previous out
 	return requestErr
 }
 
-// executeRaceRequest executes turbo http request for a URL
+// executeTurboHTTP executes turbo http request for a URL
 func (r *Request) executeTurboHTTP(reqURL string, dynamicValues, previous output.InternalEvent, callback protocols.OutputEventCallback) error {
 	generator := r.newGenerator()
 
@@ -148,7 +153,7 @@ func (r *Request) executeTurboHTTP(reqURL string, dynamicValues, previous output
 	var requestErr error
 	mutex := &sync.Mutex{}
 	for {
-		request, err := generator.Make(reqURL, dynamicValues)
+		request, err := generator.Make(reqURL, dynamicValues, "")
 		if err == io.EOF {
 			break
 		}
@@ -162,7 +167,7 @@ func (r *Request) executeTurboHTTP(reqURL string, dynamicValues, previous output
 		go func(httpRequest *generatedRequest) {
 			defer swg.Done()
 
-			err := r.executeRequest(reqURL, httpRequest, previous, callback, 0)
+			err := r.executeRequest(reqURL, httpRequest, previous, false, callback, 0)
 			mutex.Lock()
 			if err != nil {
 				requestErr = multierr.Append(requestErr, err)
@@ -189,7 +194,7 @@ func (r *Request) ExecuteWithResults(reqURL string, dynamicValues, previous outp
 
 	// verify if parallel elaboration was requested
 	if r.Threads > 0 {
-		return r.executeParallelHTTP(reqURL, dynamicValues, previous, callback)
+		return r.executeParallelHTTP(reqURL, dynamicValues, callback)
 	}
 
 	generator := r.newGenerator()
@@ -197,7 +202,13 @@ func (r *Request) ExecuteWithResults(reqURL string, dynamicValues, previous outp
 	requestCount := 1
 	var requestErr error
 	for {
-		request, err := generator.Make(reqURL, dynamicValues)
+		hasInteractMarkers := interactsh.HasMatchers(r.CompiledOperators)
+
+		var interactURL string
+		if r.options.Interactsh != nil && hasInteractMarkers {
+			interactURL = r.options.Interactsh.URL()
+		}
+		request, err := generator.Make(reqURL, dynamicValues, interactURL)
 		if err == io.EOF {
 			break
 		}
@@ -206,23 +217,40 @@ func (r *Request) ExecuteWithResults(reqURL string, dynamicValues, previous outp
 			return err
 		}
 
+		// Check if hosts just keep erroring
+		if r.options.HostErrorsCache != nil && r.options.HostErrorsCache.Check(reqURL) {
+			break
+		}
 		var gotOutput bool
 		r.options.RateLimiter.Take()
-		err = r.executeRequest(reqURL, request, previous, func(event *output.InternalWrappedEvent) {
+		err = r.executeRequest(reqURL, request, previous, hasInteractMarkers, func(event *output.InternalWrappedEvent) {
 			// Add the extracts to the dynamic values if any.
 			if event.OperatorsResult != nil {
 				gotOutput = true
 				dynamicValues = generators.MergeMaps(dynamicValues, event.OperatorsResult.DynamicValues)
 			}
-			callback(event)
+			if hasInteractMarkers && r.options.Interactsh != nil {
+				r.options.Interactsh.RequestEvent(interactURL, &interactsh.RequestData{
+					MakeResultFunc: r.MakeResultEvent,
+					Event:          event,
+					Operators:      r.CompiledOperators,
+					MatchFunc:      r.Match,
+					ExtractFunc:    r.Extract,
+				})
+			} else {
+				callback(event)
+			}
 		}, requestCount)
 		if err != nil {
-			requestErr = multierr.Append(requestErr, err)
+			if r.options.HostErrorsCache != nil && r.options.HostErrorsCache.CheckError(err) {
+				r.options.HostErrorsCache.MarkFailed(reqURL)
+			}
+			requestErr = err
 		}
 		requestCount++
 		r.options.Progress.IncrementRequests()
 
-		if request.original.options.Options.StopAtFirstMatch && gotOutput {
+		if (request.original.options.Options.StopAtFirstMatch || r.StopAtFirstMatch) && gotOutput {
 			r.options.Progress.IncrementErrorsBy(int64(generator.Total()))
 			break
 		}
@@ -233,7 +261,7 @@ func (r *Request) ExecuteWithResults(reqURL string, dynamicValues, previous outp
 const drainReqSize = int64(8 * 1024)
 
 // executeRequest executes the actual generated request and returns error if occurred
-func (r *Request) executeRequest(reqURL string, request *generatedRequest, previous output.InternalEvent, callback protocols.OutputEventCallback, requestCount int) error {
+func (r *Request) executeRequest(reqURL string, request *generatedRequest, previous output.InternalEvent, hasInteractMarkers bool, callback protocols.OutputEventCallback, requestCount int) error {
 	r.setCustomHeaders(request)
 
 	var (
@@ -243,28 +271,19 @@ func (r *Request) executeRequest(reqURL string, request *generatedRequest, previ
 		err           error
 	)
 
-	// For race conditions we can't dump the request body at this point as it's already waiting the open-gate event, already handled with a similar code within the race function
-	if !request.original.Race {
-		dumpedRequest, err = dump(request, reqURL)
-		if err != nil {
-			return err
-		}
-
-		if r.options.Options.Debug || r.options.Options.DebugRequests {
-			gologger.Info().Msgf("[%s] Dumped HTTP request for %s\n\n", r.options.TemplateID, reqURL)
-			gologger.Print().Msgf("%s", string(dumpedRequest))
-		}
-	}
-
 	var formedURL string
 	var hostname string
 	timeStart := time.Now()
 	if request.original.Pipeline {
-		formedURL = request.rawRequest.FullURL
-		if parsed, parseErr := url.Parse(formedURL); parseErr == nil {
-			hostname = parsed.Host
+		if request.rawRequest != nil {
+			formedURL = request.rawRequest.FullURL
+			if parsed, parseErr := url.Parse(formedURL); parseErr == nil {
+				hostname = parsed.Host
+			}
+			resp, err = request.pipelinedClient.DoRaw(request.rawRequest.Method, reqURL, request.rawRequest.Path, generators.ExpandMapValues(request.rawRequest.Headers), ioutil.NopCloser(strings.NewReader(request.rawRequest.Data)))
+		} else if request.request != nil {
+			resp, err = request.pipelinedClient.Dor(request.request)
 		}
-		resp, err = request.pipelinedClient.DoRaw(request.rawRequest.Method, reqURL, request.rawRequest.Path, generators.ExpandMapValues(request.rawRequest.Headers), ioutil.NopCloser(strings.NewReader(request.rawRequest.Data)))
 	} else if request.original.Unsafe && request.rawRequest != nil {
 		formedURL = request.rawRequest.FullURL
 		if parsed, parseErr := url.Parse(formedURL); parseErr == nil {
@@ -290,21 +309,50 @@ func (r *Request) executeRequest(reqURL string, request *generatedRequest, previ
 			resp, err = r.httpClient.Do(request.request)
 		}
 	}
-	if resp == nil {
-		err = errors.New("no response got for request")
+
+	// For race conditions we can't dump the request body at this point as it's already waiting the open-gate event, already handled with a similar code within the race function
+	if !request.original.Race {
+		var dumpError error
+		dumpedRequest, dumpError = dump(request, reqURL)
+		if dumpError != nil {
+			return dumpError
+		}
+
+		if r.options.Options.Debug || r.options.Options.DebugRequests {
+			gologger.Info().Msgf("[%s] Dumped HTTP request for %s\n\n", r.options.TemplateID, reqURL)
+			gologger.Print().Msgf("%s", string(dumpedRequest))
+		}
 	}
 	if err != nil {
-		// rawhttp doesn't supports draining response bodies.
+		// rawhttp doesn't support draining response bodies.
 		if resp != nil && resp.Body != nil && request.rawRequest == nil {
 			_, _ = io.CopyN(ioutil.Discard, resp.Body, drainReqSize)
 			resp.Body.Close()
 		}
 		r.options.Output.Request(r.options.TemplateID, formedURL, "http", err)
 		r.options.Progress.IncrementErrorsBy(1)
+
+		// If we have interactsh markers and request times out, still send
+		// a callback event so in case we receive an interaction, correlation is possible.
+		if hasInteractMarkers {
+			outputEvent := r.responseToDSLMap(&http.Response{}, reqURL, formedURL, tostring.UnsafeToString(dumpedRequest), "", "", "", 0, request.meta)
+			if i := strings.LastIndex(hostname, ":"); i != -1 {
+				hostname = hostname[:i]
+			}
+			outputEvent["ip"] = httpclientpool.Dialer.GetDialedIP(hostname)
+
+			event := &output.InternalWrappedEvent{InternalEvent: outputEvent}
+			if r.CompiledOperators != nil {
+				event.InternalEvent = outputEvent
+			}
+			callback(event)
+		}
 		return err
 	}
 	defer func() {
-		_, _ = io.CopyN(ioutil.Discard, resp.Body, drainReqSize)
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			_, _ = io.CopyN(ioutil.Discard, resp.Body, drainReqSize)
+		}
 		resp.Body.Close()
 	}()
 
@@ -318,28 +366,43 @@ func (r *Request) executeRequest(reqURL string, request *generatedRequest, previ
 		return errors.Wrap(err, "could not dump http response")
 	}
 
-	var bodyReader io.Reader
-	if r.MaxSize != 0 {
-		bodyReader = io.LimitReader(resp.Body, int64(r.MaxSize))
-	} else {
-		bodyReader = resp.Body
-	}
-	data, err := ioutil.ReadAll(bodyReader)
-	if err != nil {
-		return errors.Wrap(err, "could not read http body")
-	}
-	resp.Body.Close()
+	var data, redirectedResponse []byte
+	// If the status code is HTTP 101, we should not proceed with reading body.
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		var bodyReader io.Reader
+		if r.MaxSize != 0 {
+			bodyReader = io.LimitReader(resp.Body, int64(r.MaxSize))
+		} else {
+			bodyReader = resp.Body
+		}
+		data, err = ioutil.ReadAll(bodyReader)
+		if err != nil {
+			// Ignore body read due to server misconfiguration errors
+			if stringsutil.ContainsAny(err.Error(), "gzip: invalid header") {
+				gologger.Warning().Msgf("[%s] Server sent an invalid gzip header and it was not possible to read the uncompressed body for %s: %s", r.options.TemplateID, formedURL, err.Error())
+			} else if !stringsutil.ContainsAny(err.Error(), "unexpected EOF", "user canceled") { // ignore EOF and random error
+				return errors.Wrap(err, "could not read http body")
+			}
+		}
+		resp.Body.Close()
 
-	redirectedResponse, err := dumpResponseWithRedirectChain(resp, data)
-	if err != nil {
-		return errors.Wrap(err, "could not read http response with redirect chain")
+		redirectedResponse, err = dumpResponseWithRedirectChain(resp, data)
+		if err != nil {
+			return errors.Wrap(err, "could not read http response with redirect chain")
+		}
+	} else {
+		redirectedResponse = dumpedResponseHeaders
 	}
 
 	// net/http doesn't automatically decompress the response body if an
 	// encoding has been specified by the user in the request so in case we have to
 	// manually do it.
 	dataOrig := data
-	data, _ = handleDecompression(resp, data)
+	data, err = handleDecompression(resp, data)
+	// in case of error use original data
+	if err != nil {
+		data = dataOrig
+	}
 
 	// Dump response - step 2 - replace gzip body with deflated one or with itself (NOP operation)
 	dumpedResponseBuilder := &bytes.Buffer{}
@@ -347,6 +410,18 @@ func (r *Request) executeRequest(reqURL string, request *generatedRequest, previ
 	dumpedResponseBuilder.Write(data)
 	dumpedResponse := dumpedResponseBuilder.Bytes()
 	redirectedResponse = bytes.ReplaceAll(redirectedResponse, dataOrig, data)
+
+	// Decode gbk response content-types
+	if contentType := strings.ToLower(resp.Header.Get("Content-Type")); contentType != "" && (strings.Contains(contentType, "gbk") || strings.Contains(contentType, "gb2312")) {
+		dumpedResponse, err = decodegbk(dumpedResponse)
+		if err != nil {
+			return errors.Wrap(err, "could not gbk decode")
+		}
+		redirectedResponse, err = decodegbk(redirectedResponse)
+		if err != nil {
+			return errors.Wrap(err, "could not gbk decode")
+		}
+	}
 
 	// Dump response - step 2 - replace gzip body with deflated one or with itself (NOP operation)
 	if r.options.Options.Debug || r.options.Options.DebugResponse {
@@ -356,8 +431,7 @@ func (r *Request) executeRequest(reqURL string, request *generatedRequest, previ
 
 	// if nuclei-project is enabled store the response if not previously done
 	if r.options.ProjectFile != nil && !fromcache {
-		err := r.options.ProjectFile.Set(dumpedRequest, resp, data)
-		if err != nil {
+		if err := r.options.ProjectFile.Set(dumpedRequest, resp, data); err != nil {
 			return errors.Wrap(err, "could not store in project file")
 		}
 	}
@@ -372,6 +446,9 @@ func (r *Request) executeRequest(reqURL string, request *generatedRequest, previ
 	finalEvent := make(output.InternalEvent)
 
 	outputEvent := r.responseToDSLMap(resp, reqURL, matchedURL, tostring.UnsafeToString(dumpedRequest), tostring.UnsafeToString(dumpedResponse), tostring.UnsafeToString(data), headersToString(resp.Header), duration, request.meta)
+	if i := strings.LastIndex(hostname, ":"); i != -1 {
+		hostname = hostname[:i]
+	}
 	outputEvent["ip"] = httpclientpool.Dialer.GetDialedIP(hostname)
 	outputEvent["redirect-chain"] = tostring.UnsafeToString(redirectedResponse)
 	for k, v := range previous {
@@ -409,7 +486,11 @@ func (r *Request) setCustomHeaders(req *generatedRequest) {
 		if req.rawRequest != nil {
 			req.rawRequest.Headers[k] = v
 		} else {
-			req.request.Header.Set(strings.TrimSpace(k), strings.TrimSpace(v))
+			kk, vv := strings.TrimSpace(k), strings.TrimSpace(v)
+			req.request.Header.Set(kk, vv)
+			if kk == "Host" {
+				req.request.Host = vv
+			}
 		}
 	}
 }

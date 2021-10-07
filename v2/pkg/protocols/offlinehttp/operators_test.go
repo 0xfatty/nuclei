@@ -5,12 +5,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/projectdiscovery/nuclei/v2/internal/testutils"
+	"github.com/projectdiscovery/nuclei/v2/pkg/model"
+	"github.com/projectdiscovery/nuclei/v2/pkg/model/types/severity"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/extractors"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/matchers"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
-	"github.com/stretchr/testify/require"
 )
 
 func TestResponseToDSLMap(t *testing.T) {
@@ -21,7 +24,7 @@ func TestResponseToDSLMap(t *testing.T) {
 	request := &Request{}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
-		Info: map[string]interface{}{"severity": "low", "name": "test"},
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
 	executerOpts.Operators = []*operators.Operators{{}}
 	err := request.Compile(executerOpts)
@@ -34,7 +37,7 @@ func TestResponseToDSLMap(t *testing.T) {
 	matched := "http://example.com/test/?test=1"
 
 	event := request.responseToDSLMap(resp, host, matched, exampleRawRequest, exampleRawResponse, exampleResponseBody, exampleResponseHeader, 1*time.Second, map[string]interface{}{})
-	require.Len(t, event, 12, "could not get correct number of items in dsl map")
+	require.Len(t, event, 13, "could not get correct number of items in dsl map")
 	require.Equal(t, exampleRawResponse, event["response"], "could not get correct resp")
 	require.Equal(t, "Test-Response", event["test"], "could not get correct resp for header")
 }
@@ -47,7 +50,7 @@ func TestHTTPOperatorMatch(t *testing.T) {
 	request := &Request{}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
-		Info: map[string]interface{}{"severity": "low", "name": "test"},
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
 	executerOpts.Operators = []*operators.Operators{{}}
 	err := request.Compile(executerOpts)
@@ -60,7 +63,7 @@ func TestHTTPOperatorMatch(t *testing.T) {
 	matched := "http://example.com/test/?test=1"
 
 	event := request.responseToDSLMap(resp, host, matched, exampleRawRequest, exampleRawResponse, exampleResponseBody, exampleResponseHeader, 1*time.Second, map[string]interface{}{})
-	require.Len(t, event, 12, "could not get correct number of items in dsl map")
+	require.Len(t, event, 13, "could not get correct number of items in dsl map")
 	require.Equal(t, exampleRawResponse, event["response"], "could not get correct resp")
 	require.Equal(t, "Test-Response", event["test"], "could not get correct resp for header")
 
@@ -113,7 +116,7 @@ func TestHTTPOperatorExtract(t *testing.T) {
 	request := &Request{}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
-		Info: map[string]interface{}{"severity": "low", "name": "test"},
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
 	executerOpts.Operators = []*operators.Operators{{}}
 	err := request.Compile(executerOpts)
@@ -126,7 +129,7 @@ func TestHTTPOperatorExtract(t *testing.T) {
 	matched := "http://example.com/test/?test=1"
 
 	event := request.responseToDSLMap(resp, host, matched, exampleRawRequest, exampleRawResponse, exampleResponseBody, exampleResponseHeader, 1*time.Second, map[string]interface{}{})
-	require.Len(t, event, 12, "could not get correct number of items in dsl map")
+	require.Len(t, event, 13, "could not get correct number of items in dsl map")
 	require.Equal(t, exampleRawResponse, event["response"], "could not get correct resp")
 	require.Equal(t, "Test-Response", event["test-header"], "could not get correct resp for header")
 
@@ -166,7 +169,7 @@ func TestHTTPMakeResult(t *testing.T) {
 	request := &Request{}
 	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
 		ID:   templateID,
-		Info: map[string]interface{}{"severity": "low", "name": "test"},
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
 	})
 	executerOpts.Operators = []*operators.Operators{{
 		Matchers: []*matchers.Matcher{{
@@ -191,7 +194,7 @@ func TestHTTPMakeResult(t *testing.T) {
 	matched := "http://example.com/test/?test=1"
 
 	event := request.responseToDSLMap(resp, host, matched, exampleRawRequest, exampleRawResponse, exampleResponseBody, exampleResponseHeader, 1*time.Second, map[string]interface{}{})
-	require.Len(t, event, 12, "could not get correct number of items in dsl map")
+	require.Len(t, event, 13, "could not get correct number of items in dsl map")
 	require.Equal(t, exampleRawResponse, event["response"], "could not get correct resp")
 	require.Equal(t, "Test-Response", event["test"], "could not get correct resp for header")
 

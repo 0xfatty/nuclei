@@ -14,16 +14,20 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/net/proxy"
+	"golang.org/x/net/publicsuffix"
+
 	"github.com/projectdiscovery/fastdialer/fastdialer"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/protocolstate"
 	"github.com/projectdiscovery/nuclei/v2/pkg/types"
 	"github.com/projectdiscovery/rawhttp"
 	"github.com/projectdiscovery/retryablehttp-go"
-	"golang.org/x/net/proxy"
-	"golang.org/x/net/publicsuffix"
 )
 
 var (
-	Dialer        *fastdialer.Dialer
+	// Dialer is a copy of the fastdialer from protocolstate
+	Dialer *fastdialer.Dialer
+
 	rawhttpClient *rawhttp.Client
 	poolMutex     *sync.RWMutex
 	normalClient  *retryablehttp.Client
@@ -32,7 +36,7 @@ var (
 
 // Init initializes the clientpool implementation
 func Init(options *types.Options) error {
-	// Don't create clients if already created in past.
+	// Don't create clients if already created in the past.
 	if normalClient != nil {
 		return nil
 	}
@@ -47,6 +51,12 @@ func Init(options *types.Options) error {
 	return nil
 }
 
+// ConnectionConfiguration contains the custom configuration options for a connection
+type ConnectionConfiguration struct {
+	// DisableKeepAlive of the connection
+	DisableKeepAlive bool
+}
+
 // Configuration contains the custom configuration options for a client
 type Configuration struct {
 	// Threads contains the threads for the client
@@ -57,6 +67,8 @@ type Configuration struct {
 	CookieReuse bool
 	// FollowRedirects specifies whether to follow redirects
 	FollowRedirects bool
+	// Connection defines custom connection configuration
+	Connection *ConnectionConfiguration
 }
 
 // Hash returns the hash of the configuration to allow client pooling
@@ -71,43 +83,42 @@ func (c *Configuration) Hash() string {
 	builder.WriteString(strconv.FormatBool(c.FollowRedirects))
 	builder.WriteString("r")
 	builder.WriteString(strconv.FormatBool(c.CookieReuse))
+	builder.WriteString("c")
+	builder.WriteString(strconv.FormatBool(c.Connection != nil))
 	hash := builder.String()
 	return hash
 }
 
+// HasStandardOptions checks whether the configuration requires custom settings
+func (c *Configuration) HasStandardOptions() bool {
+	return c.Threads == 0 && c.MaxRedirects == 0 && !c.FollowRedirects && !c.CookieReuse && c.Connection == nil
+}
+
 // GetRawHTTP returns the rawhttp request client
-func GetRawHTTP() *rawhttp.Client {
+func GetRawHTTP(options *types.Options) *rawhttp.Client {
 	if rawhttpClient == nil {
-		rawhttpClient = rawhttp.NewClient(rawhttp.DefaultOptions)
+		rawhttpOptions := rawhttp.DefaultOptions
+		rawhttpOptions.Timeout = time.Duration(options.Timeout) * time.Second
+		rawhttpClient = rawhttp.NewClient(rawhttpOptions)
 	}
 	return rawhttpClient
 }
 
 // Get creates or gets a client for the protocol based on custom configuration
 func Get(options *types.Options, configuration *Configuration) (*retryablehttp.Client, error) {
-	if configuration.Threads == 0 && configuration.MaxRedirects == 0 && !configuration.FollowRedirects && !configuration.CookieReuse {
+	if configuration.HasStandardOptions() {
 		return normalClient, nil
 	}
 	return wrappedGet(options, configuration)
 }
 
-// wrappedGet wraps a get operation without normal cliet check
+// wrappedGet wraps a get operation without normal client check
 func wrappedGet(options *types.Options, configuration *Configuration) (*retryablehttp.Client, error) {
 	var proxyURL *url.URL
 	var err error
 
 	if Dialer == nil {
-		opts := fastdialer.DefaultOptions
-		if options.SystemResolvers {
-			opts.EnableFallback = true
-		}
-		if options.ResolversFile != "" {
-			opts.BaseResolvers = options.InternalResolversList
-		}
-		Dialer, err = fastdialer.NewDialer(opts)
-	}
-	if err != nil {
-		return nil, errors.Wrap(err, "could not create dialer")
+		Dialer = protocolstate.Dialer
 	}
 
 	hash := configuration.Hash()
@@ -144,6 +155,11 @@ func wrappedGet(options *types.Options, configuration *Configuration) (*retryabl
 	retryablehttpOptions.RetryMax = options.Retries
 	followRedirects := configuration.FollowRedirects
 	maxRedirects := configuration.MaxRedirects
+
+	// override connection's settings if required
+	if configuration.Connection != nil {
+		disableKeepAlives = configuration.Connection.DisableKeepAlive
+	}
 
 	transport := &http.Transport{
 		DialContext:         Dialer.Dial,

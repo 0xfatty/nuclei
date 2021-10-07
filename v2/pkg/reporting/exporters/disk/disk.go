@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
 	"strings"
 
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
@@ -16,7 +16,7 @@ type Exporter struct {
 	options   *Options
 }
 
-// Options contains the configuration options for github issue tracker client
+// Options contains the configuration options for GitHub issue tracker client
 type Options struct {
 	// Directory is the directory to export found results to
 	Directory string `yaml:"directory"`
@@ -46,7 +46,7 @@ func (i *Exporter) Export(event *output.ResultEvent) error {
 	filenameBuilder.WriteString("-")
 	filenameBuilder.WriteString(strings.ReplaceAll(strings.ReplaceAll(event.Matched, "/", "_"), ":", "_"))
 	filenameBuilder.WriteString(".md")
-	finalFilename := filenameBuilder.String()
+	finalFilename := sanitizeFilename(filenameBuilder.String())
 
 	dataBuilder := &bytes.Buffer{}
 	dataBuilder.WriteString("### ")
@@ -55,6 +55,17 @@ func (i *Exporter) Export(event *output.ResultEvent) error {
 	dataBuilder.WriteString(description)
 	data := dataBuilder.Bytes()
 
-	err := ioutil.WriteFile(path.Join(i.directory, finalFilename), data, 0644)
-	return err
+	return ioutil.WriteFile(filepath.Join(i.directory, finalFilename), data, 0644)
+}
+
+// Close closes the exporter after operation
+func (i *Exporter) Close() error {
+	return nil
+}
+
+func sanitizeFilename(filename string) string {
+	if len(filename) > 256 {
+		filename = filename[0:255]
+	}
+	return filename
 }

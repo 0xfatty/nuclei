@@ -2,6 +2,7 @@ package clusterer
 
 import (
 	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/nuclei/v2/pkg/model"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols"
@@ -22,7 +23,8 @@ type Executer struct {
 
 type clusteredOperator struct {
 	templateID   string
-	templateInfo map[string]interface{}
+	templatePath string
+	templateInfo model.Info
 	operator     *operators.Operators
 }
 
@@ -38,6 +40,7 @@ func NewExecuter(requests []*templates.Template, options *protocols.ExecuterOpti
 		executer.operators = append(executer.operators, &clusteredOperator{
 			templateID:   req.ID,
 			templateInfo: req.Info,
+			templatePath: req.Path,
 			operator:     req.RequestsHTTP[0].CompiledOperators,
 		})
 	}
@@ -60,13 +63,15 @@ func (e *Executer) Requests() int {
 func (e *Executer) Execute(input string) (bool, error) {
 	var results bool
 
+	previous := make(map[string]interface{})
 	dynamicValues := make(map[string]interface{})
-	err := e.requests.ExecuteWithResults(input, dynamicValues, nil, func(event *output.InternalWrappedEvent) {
+	err := e.requests.ExecuteWithResults(input, dynamicValues, previous, func(event *output.InternalWrappedEvent) {
 		for _, operator := range e.operators {
 			result, matched := operator.operator.Execute(event.InternalEvent, e.requests.Match, e.requests.Extract)
 			if matched && result != nil {
 				event.OperatorsResult = result
 				event.InternalEvent["template-id"] = operator.templateID
+				event.InternalEvent["template-path"] = operator.templatePath
 				event.InternalEvent["template-info"] = operator.templateInfo
 				event.Results = e.requests.MakeResultEvent(event)
 				results = true
@@ -82,6 +87,9 @@ func (e *Executer) Execute(input string) (bool, error) {
 			}
 		}
 	})
+	if err != nil && e.options.HostErrorsCache != nil && e.options.HostErrorsCache.CheckError(err) {
+		e.options.HostErrorsCache.MarkFailed(input)
+	}
 	return results, err
 }
 
@@ -94,11 +102,15 @@ func (e *Executer) ExecuteWithResults(input string, callback protocols.OutputEve
 			if matched && result != nil {
 				event.OperatorsResult = result
 				event.InternalEvent["template-id"] = operator.templateID
+				event.InternalEvent["template-path"] = operator.templatePath
 				event.InternalEvent["template-info"] = operator.templateInfo
 				event.Results = e.requests.MakeResultEvent(event)
 				callback(event)
 			}
 		}
 	})
+	if err != nil && e.options.HostErrorsCache != nil && e.options.HostErrorsCache.CheckError(err) {
+		e.options.HostErrorsCache.MarkFailed(input)
+	}
 	return err
 }

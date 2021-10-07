@@ -24,8 +24,7 @@ func NewExecuter(requests []protocols.Request, options *protocols.ExecuterOption
 // Compile compiles the execution generators preparing any requests possible.
 func (e *Executer) Compile() error {
 	for _, request := range e.requests {
-		err := request.Compile(e.options)
-		if err != nil {
+		if err := request.Compile(e.options); err != nil {
 			return err
 		}
 	}
@@ -77,6 +76,11 @@ func (e *Executer) Execute(input string) (bool, error) {
 			}
 		})
 		if err != nil {
+			if e.options.HostErrorsCache != nil {
+				if e.options.HostErrorsCache.CheckError(err) {
+					e.options.HostErrorsCache.MarkFailed(input)
+				}
+			}
 			gologger.Warning().Msgf("[%s] Could not execute request for %s: %s\n", e.options.TemplateID, input, err)
 		}
 	}
@@ -109,6 +113,11 @@ func (e *Executer) ExecuteWithResults(input string, callback protocols.OutputEve
 			callback(event)
 		})
 		if err != nil {
+			if e.options.HostErrorsCache != nil {
+				if e.options.HostErrorsCache.CheckError(err) {
+					e.options.HostErrorsCache.MarkFailed(input)
+				}
+			}
 			gologger.Warning().Msgf("[%s] Could not execute request for %s: %s\n", e.options.TemplateID, input, err)
 		}
 	}

@@ -1,8 +1,11 @@
 package file
 
 import (
+	"bufio"
+	"strings"
 	"time"
 
+	"github.com/projectdiscovery/nuclei/v2/pkg/model"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/extractors"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/matchers"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
@@ -38,7 +41,7 @@ func (r *Request) Match(data map[string]interface{}, matcher *matchers.Matcher) 
 	return false
 }
 
-// Extract performs extracting operation for a extractor on model and returns true or false.
+// Extract performs extracting operation for an extractor on model and returns true or false.
 func (r *Request) Extract(data map[string]interface{}, extractor *extractors.Extractor) map[string]struct{} {
 	partString := extractor.Part
 	switch partString {
@@ -71,6 +74,7 @@ func (r *Request) responseToDSLMap(raw, host, matched string) output.InternalEve
 	data["raw"] = raw
 	data["template-id"] = r.options.TemplateID
 	data["template-info"] = r.options.TemplateInfo
+	data["template-path"] = r.options.TemplatePath
 	return data
 }
 
@@ -99,21 +103,48 @@ func (r *Request) MakeResultEvent(wrapped *output.InternalWrappedEvent) []*outpu
 		data := r.makeResultEventItem(wrapped)
 		results = append(results, data)
 	}
+	raw, ok := wrapped.InternalEvent["raw"]
+	if !ok {
+		return results
+	}
+	rawStr, ok := raw.(string)
+	if !ok {
+		return results
+	}
+
+	// Identify the position of match in file using a dirty hack.
+	for _, result := range results {
+		for _, extraction := range result.ExtractedResults {
+			scanner := bufio.NewScanner(strings.NewReader(rawStr))
+
+			line := 1
+			for scanner.Scan() {
+				if strings.Contains(scanner.Text(), extraction) {
+					if result.FileToIndexPosition == nil {
+						result.FileToIndexPosition = make(map[string]int)
+					}
+					result.FileToIndexPosition[result.Matched] = line
+					continue
+				}
+				line++
+			}
+		}
+	}
 	return results
 }
 
 func (r *Request) makeResultEventItem(wrapped *output.InternalWrappedEvent) *output.ResultEvent {
 	data := &output.ResultEvent{
 		TemplateID:       types.ToString(wrapped.InternalEvent["template-id"]),
-		Info:             wrapped.InternalEvent["template-info"].(map[string]interface{}),
+		TemplatePath:     types.ToString(wrapped.InternalEvent["template-path"]),
+		Info:             wrapped.InternalEvent["template-info"].(model.Info),
 		Type:             "file",
 		Path:             types.ToString(wrapped.InternalEvent["path"]),
 		Matched:          types.ToString(wrapped.InternalEvent["matched"]),
+		Host:             types.ToString(wrapped.InternalEvent["matched"]),
 		ExtractedResults: wrapped.OperatorsResult.OutputExtracts,
+		Response:         types.ToString(wrapped.InternalEvent["raw"]),
 		Timestamp:        time.Now(),
-	}
-	if r.options.Options.JSONRequests {
-		data.Response = types.ToString(wrapped.InternalEvent["raw"])
 	}
 	return data
 }

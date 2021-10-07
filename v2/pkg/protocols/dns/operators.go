@@ -5,6 +5,8 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/projectdiscovery/nuclei/v2/pkg/model"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/extractors"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/matchers"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
@@ -41,7 +43,7 @@ func (r *Request) Match(data map[string]interface{}, matcher *matchers.Matcher) 
 	return false
 }
 
-// Extract performs extracting operation for a extractor on model and returns true or false.
+// Extract performs extracting operation for an extractor on model and returns true or false.
 func (r *Request) Extract(data map[string]interface{}, extractor *extractors.Extractor) map[string]struct{} {
 	part := extractor.Part
 	switch part {
@@ -103,6 +105,7 @@ func (r *Request) responseToDSLMap(req, resp *dns.Msg, host, matched string) out
 	data["raw"] = rawData
 	data["template-id"] = r.options.TemplateID
 	data["template-info"] = r.options.TemplateInfo
+	data["template-path"] = r.options.TemplatePath
 	return data
 }
 
@@ -137,16 +140,15 @@ func (r *Request) MakeResultEvent(wrapped *output.InternalWrappedEvent) []*outpu
 func (r *Request) makeResultEventItem(wrapped *output.InternalWrappedEvent) *output.ResultEvent {
 	data := &output.ResultEvent{
 		TemplateID:       types.ToString(wrapped.InternalEvent["template-id"]),
-		Info:             wrapped.InternalEvent["template-info"].(map[string]interface{}),
+		TemplatePath:     types.ToString(wrapped.InternalEvent["template-path"]),
+		Info:             wrapped.InternalEvent["template-info"].(model.Info),
 		Type:             "dns",
 		Host:             types.ToString(wrapped.InternalEvent["host"]),
 		Matched:          types.ToString(wrapped.InternalEvent["matched"]),
 		ExtractedResults: wrapped.OperatorsResult.OutputExtracts,
 		Timestamp:        time.Now(),
-	}
-	if r.options.Options.JSONRequests {
-		data.Request = types.ToString(wrapped.InternalEvent["request"])
-		data.Response = types.ToString(wrapped.InternalEvent["raw"])
+		Request:          types.ToString(wrapped.InternalEvent["request"]),
+		Response:         types.ToString(wrapped.InternalEvent["raw"]),
 	}
 	return data
 }

@@ -3,6 +3,8 @@ package http
 import (
 	"bytes"
 	"compress/gzip"
+	"compress/zlib"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
@@ -11,6 +13,8 @@ import (
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/generators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/tostring"
 	"github.com/projectdiscovery/rawhttp"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/transform"
 )
 
 // dumpResponseWithRedirectChain dumps a http response with the
@@ -100,19 +104,34 @@ func handleDecompression(resp *http.Response, bodyOrig []byte) (bodyDec []byte, 
 		return bodyOrig, nil
 	}
 
-	encodingHeader := strings.TrimSpace(strings.ToLower(resp.Header.Get("Content-Encoding")))
-	if strings.Contains(encodingHeader, "gzip") {
-		gzipreader, err := gzip.NewReader(bytes.NewReader(bodyOrig))
-		if err != nil {
-			return bodyOrig, err
-		}
-		defer gzipreader.Close()
-
-		bodyDec, err = ioutil.ReadAll(gzipreader)
-		if err != nil {
-			return bodyOrig, err
-		}
-		return bodyDec, nil
+	var reader io.ReadCloser
+	switch resp.Header.Get("Content-Encoding") {
+	case "gzip":
+		reader, err = gzip.NewReader(bytes.NewReader(bodyOrig))
+	case "deflate":
+		reader, err = zlib.NewReader(bytes.NewReader(bodyOrig))
+	default:
+		return bodyOrig, nil
 	}
-	return bodyOrig, nil
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	bodyDec, err = ioutil.ReadAll(reader)
+	if err != nil {
+		return bodyOrig, err
+	}
+	return bodyDec, nil
+}
+
+// decodegbk converts GBK to UTF-8
+func decodegbk(s []byte) ([]byte, error) {
+	I := bytes.NewReader(s)
+	O := transform.NewReader(I, simplifiedchinese.GBK.NewDecoder())
+	d, e := ioutil.ReadAll(O)
+	if e != nil {
+		return nil, e
+	}
+	return d, nil
 }

@@ -2,7 +2,6 @@ package offlinehttp
 
 import (
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -18,8 +17,7 @@ func (r *Request) getInputPaths(target string, callback func(string)) error {
 
 	// Template input includes a wildcard
 	if strings.Contains(target, "*") {
-		err := r.findGlobPathMatches(target, processed, callback)
-		if err != nil {
+		if err := r.findGlobPathMatches(target, processed, callback); err != nil {
 			return errors.Wrap(err, "could not find glob matches")
 		}
 		return nil
@@ -36,8 +34,7 @@ func (r *Request) getInputPaths(target string, callback func(string)) error {
 
 	// Recursively walk down the Templates directory and run all
 	// the template file checks
-	err = r.findDirectoryMatches(target, processed, callback)
-	if err != nil {
+	if err := r.findDirectoryMatches(target, processed, callback); err != nil {
 		return errors.Wrap(err, "could not find directory matches")
 	}
 	return nil
@@ -50,7 +47,7 @@ func (r *Request) findGlobPathMatches(absPath string, processed map[string]struc
 		return errors.Errorf("wildcard found, but unable to glob: %s\n", err)
 	}
 	for _, match := range matches {
-		if path.Ext(match) != ".txt" {
+		if filepath.Ext(match) != ".txt" {
 			continue // only process .txt files
 		}
 		if _, ok := processed[match]; !ok {
@@ -71,7 +68,7 @@ func (r *Request) findFileMatches(absPath string, processed map[string]struct{},
 	if !info.Mode().IsRegular() {
 		return false, nil
 	}
-	if path.Ext(absPath) != ".txt" {
+	if filepath.Ext(absPath) != ".txt" {
 		return false, nil // only process .txt files
 	}
 	if _, ok := processed[absPath]; !ok {
@@ -92,7 +89,7 @@ func (r *Request) findDirectoryMatches(absPath string, processed map[string]stru
 			if d.IsDir() {
 				return nil
 			}
-			if path.Ext(p) != ".txt" {
+			if filepath.Ext(p) != ".txt" {
 				return nil // only process .txt files
 			}
 			if _, ok := processed[p]; !ok {

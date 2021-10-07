@@ -2,7 +2,6 @@ package file
 
 import (
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -19,8 +18,7 @@ func (r *Request) getInputPaths(target string, callback func(string)) error {
 
 	// Template input includes a wildcard
 	if strings.Contains(target, "*") && !r.NoRecursive {
-		err := r.findGlobPathMatches(target, processed, callback)
-		if err != nil {
+		if err := r.findGlobPathMatches(target, processed, callback); err != nil {
 			return errors.Wrap(err, "could not find glob matches")
 		}
 		return nil
@@ -39,8 +37,7 @@ func (r *Request) getInputPaths(target string, callback func(string)) error {
 	}
 	// Recursively walk down the Templates directory and run all
 	// the template file checks
-	err = r.findDirectoryMatches(target, processed, callback)
-	if err != nil {
+	if err := r.findDirectoryMatches(target, processed, callback); err != nil {
 		return errors.Wrap(err, "could not find directory matches")
 	}
 	return nil
@@ -110,7 +107,7 @@ func (r *Request) findDirectoryMatches(absPath string, processed map[string]stru
 
 // validatePath validates a file path for blacklist and whitelist options
 func (r *Request) validatePath(item string) bool {
-	extension := path.Ext(item)
+	extension := filepath.Ext(item)
 
 	if len(r.extensions) > 0 {
 		if _, ok := r.extensions[extension]; ok {

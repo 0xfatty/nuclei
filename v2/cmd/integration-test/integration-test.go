@@ -13,6 +13,8 @@ var (
 	debug      = os.Getenv("DEBUG") == "true"
 	customTest = os.Getenv("TEST")
 	protocol   = os.Getenv("PROTO")
+
+	errored = false
 )
 
 func main() {
@@ -33,15 +35,17 @@ func main() {
 				if customTest != "" && !strings.Contains(file, customTest) {
 					continue // only run tests user asked
 				}
-				err := test.Execute(file)
-				if err != nil {
+				if err := test.Execute(file); err != nil {
 					fmt.Fprintf(os.Stderr, "%s Test \"%s\" failed: %s\n", failed, file, err)
-					os.Exit(1)
+					errored = true
 				} else {
 					fmt.Printf("%s Test \"%s\" passed!\n", success, file)
 				}
 			}
 		}
+	}
+	if errored {
+		os.Exit(1)
 	}
 }
 

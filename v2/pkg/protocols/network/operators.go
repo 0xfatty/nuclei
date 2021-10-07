@@ -3,6 +3,7 @@ package network
 import (
 	"time"
 
+	"github.com/projectdiscovery/nuclei/v2/pkg/model"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/extractors"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators/matchers"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
@@ -38,7 +39,7 @@ func (r *Request) Match(data map[string]interface{}, matcher *matchers.Matcher) 
 	return false
 }
 
-// Extract performs extracting operation for a extractor on model and returns true or false.
+// Extract performs extracting operation for an extractor on model and returns true or false.
 func (r *Request) Extract(data map[string]interface{}, extractor *extractors.Extractor) map[string]struct{} {
 	partString := extractor.Part
 	switch partString {
@@ -73,6 +74,7 @@ func (r *Request) responseToDSLMap(req, resp, raw, host, matched string) output.
 	data["raw"] = raw   // Raw is the full transaction data for network
 	data["template-id"] = r.options.TemplateID
 	data["template-info"] = r.options.TemplateInfo
+	data["template-path"] = r.options.TemplatePath
 	return data
 }
 
@@ -107,17 +109,17 @@ func (r *Request) MakeResultEvent(wrapped *output.InternalWrappedEvent) []*outpu
 func (r *Request) makeResultEventItem(wrapped *output.InternalWrappedEvent) *output.ResultEvent {
 	data := &output.ResultEvent{
 		TemplateID:       types.ToString(wrapped.InternalEvent["template-id"]),
-		Info:             wrapped.InternalEvent["template-info"].(map[string]interface{}),
+		TemplatePath:     types.ToString(wrapped.InternalEvent["template-path"]),
+		Info:             wrapped.InternalEvent["template-info"].(model.Info),
 		Type:             "network",
 		Host:             types.ToString(wrapped.InternalEvent["host"]),
 		Matched:          types.ToString(wrapped.InternalEvent["matched"]),
 		ExtractedResults: wrapped.OperatorsResult.OutputExtracts,
+		Metadata:         wrapped.OperatorsResult.PayloadValues,
 		Timestamp:        time.Now(),
 		IP:               types.ToString(wrapped.InternalEvent["ip"]),
-	}
-	if r.options.Options.JSONRequests {
-		data.Request = types.ToString(wrapped.InternalEvent["request"])
-		data.Response = types.ToString(wrapped.InternalEvent["data"])
+		Request:          types.ToString(wrapped.InternalEvent["request"]),
+		Response:         types.ToString(wrapped.InternalEvent["data"]),
 	}
 	return data
 }

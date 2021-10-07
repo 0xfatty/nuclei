@@ -2,10 +2,6 @@
 
 package generators
 
-import (
-	"errors"
-)
-
 // Generator is the generator struct for generating payloads
 type Generator struct {
 	Type     Type
@@ -16,7 +12,7 @@ type Generator struct {
 type Type int
 
 const (
-	// Sniper replaces each variables with values at a time.
+	// Sniper replaces each variable with values at a time.
 	Sniper Type = iota + 1
 	// PitchFork replaces variables with positional value from multiple wordlists
 	PitchFork
@@ -24,7 +20,7 @@ const (
 	ClusterBomb
 )
 
-// StringToType is an table for conversion of attack type from string.
+// StringToType is a table for conversion of attack type from string.
 var StringToType = map[string]Type{
 	"sniper":      Sniper,
 	"pitchfork":   PitchFork,
@@ -45,16 +41,6 @@ func New(payloads map[string]interface{}, payloadType Type, templatePath string)
 	generator.Type = payloadType
 	generator.payloads = compiled
 
-	// Validate the payload types
-	if payloadType == PitchFork {
-		var totalLength int
-		for v := range compiled {
-			if totalLength != 0 && totalLength != len(v) {
-				return nil, errors.New("pitchfork payloads must be of equal number")
-			}
-			totalLength = len(v)
-		}
-	}
 	return generator, nil
 }
 
@@ -107,6 +93,11 @@ func (i *Iterator) Total() int {
 		}
 	case PitchFork:
 		count = len(i.payloads[0].values)
+		for _, p := range i.payloads {
+			if count > len(p.values) {
+				count = len(p.values)
+			}
+		}
 	case ClusterBomb:
 		count = 1
 		for _, p := range i.payloads {

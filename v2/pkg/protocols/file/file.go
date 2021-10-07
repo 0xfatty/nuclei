@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
+
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/protocols"
 )
@@ -12,32 +13,47 @@ import (
 type Request struct {
 	// Operators for the current request go here.
 	operators.Operators `yaml:",inline"`
-	// Extensions is the list of extensions to perform matching on.
-	Extensions []string `yaml:"extensions"`
-	// ExtensionDenylist is the list of file extensions to deny during matching.
-	ExtensionDenylist []string `yaml:"denylist"`
+	// description: |
+	//   Extensions is the list of extensions to perform matching on.
+	// examples:
+	//   - value: '[]string{".txt", ".go", ".json"}'
+	Extensions []string `yaml:"extensions,omitempty" jsonschema:"title=extensions to match,description=List of extensions to perform matching on"`
+	// description: |
+	//   ExtensionDenylist is the list of file extensions to deny during matching.
+	//
+	//   By default, it contains some non-interesting extensions that are hardcoded
+	//   in nuclei.
+	// examples:
+	//   - value: '[]string{".avi", ".mov", ".mp3"}'
+	ExtensionDenylist []string `yaml:"denylist,omitempty" jsonschema:"title=extensions to deny match,description=List of file extensions to deny during matching"`
 
-	ID string `yaml:"id"`
+	// ID is the optional id of the request
+	ID string `yaml:"id,omitempty" jsonschema:"title=id of the request,description=ID is the optional ID for the request"`
 
-	// MaxSize is the maximum size of the file to run request on.
-	// By default, nuclei will process 5MB files and not go more than that.
-	// It can be set to much lower or higher depending on use.
-	MaxSize           int `yaml:"max-size"`
-	CompiledOperators *operators.Operators
+	// description: |
+	//   MaxSize is the maximum size of the file to run request on.
+	//
+	//   By default, nuclei will process 5 MB files and not go more than that.
+	//   It can be set to much lower or higher depending on use.
+	// examples:
+	//   - value: 2048
+	MaxSize           int                  `yaml:"max-size,omitempty" jsonschema:"title=max size data to run request on,description=Maximum size of the file to run request on"`
+	CompiledOperators *operators.Operators `yaml:"-"`
 
 	// cache any variables that may be needed for operation.
 	options           *protocols.ExecuterOptions
 	extensions        map[string]struct{}
 	extensionDenylist map[string]struct{}
 
-	// NoRecursive specifies whether to not do recursive checks if folders are provided.
-	NoRecursive bool `yaml:"no-recursive"`
+	// description: |
+	//   NoRecursive specifies whether to not do recursive checks if folders are provided.
+	NoRecursive bool `yaml:"no-recursive,omitempty" jsonschema:"title=do not perform recursion,description=Specifies whether to not do recursive checks if folders are provided"`
 
 	allExtensions bool
 }
 
 // defaultDenylist is the default list of extensions to be denied
-var defaultDenylist = []string{".3g2", ".3gp", ".7z", ".apk", ".arj", ".avi", ".axd", ".bmp", ".css", ".csv", ".deb", ".dll", ".doc", ".drv", ".eot", ".exe", ".flv", ".gif", ".gifv", ".gz", ".h264", ".ico", ".iso", ".jar", ".jpeg", ".jpg", ".lock", ".m4a", ".m4v", ".map", ".mkv", ".mov", ".mp3", ".mp4", ".mpeg", ".mpg", ".msi", ".ogg", ".ogm", ".ogv", ".otf", ".pdf", ".pkg", ".png", ".ppt", ".psd", ".rar", ".rm", ".rpm", ".svg", ".swf", ".sys", ".tar.gz", ".tar", ".tif", ".tiff", ".ttf", ".txt", ".vob", ".wav", ".webm", ".wmv", ".woff", ".woff2", ".xcf", ".xls", ".xlsx", ".zip"}
+var defaultDenylist = []string{".3g2", ".3gp", ".7z", ".apk", ".arj", ".avi", ".axd", ".bmp", ".css", ".csv", ".deb", ".dll", ".doc", ".drv", ".eot", ".exe", ".flv", ".gif", ".gifv", ".gz", ".h264", ".ico", ".iso", ".jar", ".jpeg", ".jpg", ".lock", ".m4a", ".m4v", ".map", ".mkv", ".mov", ".mp3", ".mp4", ".mpeg", ".mpg", ".msi", ".ogg", ".ogm", ".ogv", ".otf", ".pdf", ".pkg", ".png", ".ppt", ".psd", ".rar", ".rm", ".rpm", ".svg", ".swf", ".sys", ".tar.gz", ".tar", ".tif", ".tiff", ".ttf", ".vob", ".wav", ".webm", ".wmv", ".woff", ".woff2", ".xcf", ".xls", ".xlsx", ".zip"}
 
 // GetID returns the unique ID of the request if any.
 func (r *Request) GetID() string {
@@ -53,7 +69,7 @@ func (r *Request) Compile(options *protocols.ExecuterOptions) error {
 		}
 		r.CompiledOperators = compiled
 	}
-	// By default use 5mb as max size to read.
+	// By default, use 5 MB as max size to read.
 	if r.MaxSize == 0 {
 		r.MaxSize = 5 * 1024 * 1024
 	}
