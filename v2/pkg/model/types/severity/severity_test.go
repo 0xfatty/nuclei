@@ -6,6 +6,7 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestYamlUnmarshal(t *testing.T) {
@@ -26,10 +27,11 @@ func TestYamlUnmarshalFail(t *testing.T) {
 
 func TestGetSupportedSeverities(t *testing.T) {
 	severities := GetSupportedSeverities()
-	assert.Equal(t, severities, Severities{Info, Low, Medium, High, Critical})
+	assert.Equal(t, severities, Severities{Info, Low, Medium, High, Critical, Unknown})
 }
 
 func testUnmarshal(t *testing.T, unmarshaller func(data []byte, v interface{}) error, payloadCreator func(value string) string) {
+	t.Helper()
 	payloads := [...]string{
 		payloadCreator("Info"),
 		payloadCreator("info"),
@@ -48,6 +50,7 @@ func testUnmarshal(t *testing.T, unmarshaller func(data []byte, v interface{}) e
 }
 
 func testUnmarshalFail(t *testing.T, unmarshaller func(data []byte, v interface{}) error, payloadCreator func(value string) string) {
+	t.Helper()
 	assert.Panics(t, func() { unmarshal(payloadCreator("invalid"), unmarshaller) })
 }
 
@@ -62,4 +65,13 @@ func unmarshal(value string, unmarshaller func(data []byte, v interface{}) error
 
 func createYAML(value string) string {
 	return "severity: " + value + "\n"
+}
+
+func TestMarshalJSON(t *testing.T) {
+	unmarshalled := Severities{Low, Medium}
+	data, err := unmarshalled.MarshalJSON()
+	if err != nil {
+		panic(err)
+	}
+	require.Equal(t, "[\"low\",\"medium\"]", string(data), "could not marshal json")
 }

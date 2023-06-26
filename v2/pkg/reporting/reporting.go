@@ -1,42 +1,32 @@
 package reporting
 
 import (
-	"strings"
+	"os"
 
-	"github.com/pkg/errors"
+	"github.com/projectdiscovery/nuclei/v2/pkg/catalog/config"
+	json_exporter "github.com/projectdiscovery/nuclei/v2/pkg/reporting/exporters/jsonexporter"
+	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/exporters/jsonl"
+
 	"go.uber.org/multierr"
+	"gopkg.in/yaml.v2"
+
+	"errors"
 
 	"github.com/projectdiscovery/nuclei/v2/pkg/model/types/severity"
 	"github.com/projectdiscovery/nuclei/v2/pkg/model/types/stringslice"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/dedupe"
-	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/exporters/disk"
 	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/exporters/es"
+	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/exporters/markdown"
 	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/exporters/sarif"
+	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/exporters/splunk"
 	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/trackers/github"
 	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/trackers/gitlab"
 	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/trackers/jira"
+	errorutil "github.com/projectdiscovery/utils/errors"
+	fileutil "github.com/projectdiscovery/utils/file"
+	sliceutil "github.com/projectdiscovery/utils/slice"
 )
-
-// Options is a configuration file for nuclei reporting module
-type Options struct {
-	// AllowList contains a list of allowed events for reporting module
-	AllowList *Filter `yaml:"allow-list"`
-	// DenyList contains a list of denied events for reporting module
-	DenyList *Filter `yaml:"deny-list"`
-	// Github contains configuration options for Github Issue Tracker
-	Github *github.Options `yaml:"github"`
-	// Gitlab contains configuration options for Gitlab Issue Tracker
-	Gitlab *gitlab.Options `yaml:"gitlab"`
-	// Jira contains configuration options for Jira Issue Tracker
-	Jira *jira.Options `yaml:"jira"`
-	// DiskExporter contains configuration options for Disk Exporter Module
-	DiskExporter *disk.Options `yaml:"disk"`
-	// SarifExporter contains configuration options for Sarif Exporter Module
-	SarifExporter *sarif.Options `yaml:"sarif"`
-	// ElasticsearchExporter contains configuration options for Elasticsearch Exporter Module
-	ElasticsearchExporter *es.Options `yaml:"elasticsearch"`
-}
 
 // Filter filters the received event and decides whether to perform
 // reporting for it or not.
@@ -44,6 +34,11 @@ type Filter struct {
 	Severities severity.Severities     `yaml:"severity"`
 	Tags       stringslice.StringSlice `yaml:"tags"`
 }
+
+var (
+	ErrReportingClientCreation = errors.New("could not create reporting client")
+	ErrExportClientCreation    = errors.New("could not create exporting client")
+)
 
 // GetMatch returns true if a filter matches result event
 func (filter *Filter) GetMatch(event *output.ResultEvent) bool {
@@ -57,8 +52,8 @@ func isTagMatch(event *output.ResultEvent, filter *Filter) bool {
 	}
 
 	tags := event.Info.Tags.ToSlice()
-	for _, tag := range filterTags.ToSlice() {
-		if stringSliceContains(tags, tag) {
+	for _, filterTag := range filterTags.ToSlice() {
+		if sliceutil.Contains(tags, filterTag) {
 			return true
 		}
 	}
@@ -73,13 +68,7 @@ func isSeverityMatch(event *output.ResultEvent, filter *Filter) bool {
 		return true
 	}
 
-	for _, current := range filter.Severities {
-		if current == resultEventSeverity {
-			return true
-		}
-	}
-
-	return false
+	return sliceutil.Contains(filter.Severities, resultEventSeverity)
 }
 
 // Tracker is an interface implemented by an issue tracker
@@ -96,8 +85,8 @@ type Exporter interface {
 	Export(event *output.ResultEvent) error
 }
 
-// Client is a client for nuclei issue tracking module
-type Client struct {
+// ReportingClient is a client for nuclei issue tracking module
+type ReportingClient struct {
 	trackers  []Tracker
 	exporters []Exporter
 	options   *Options
@@ -105,47 +94,74 @@ type Client struct {
 }
 
 // New creates a new nuclei issue tracker reporting client
-func New(options *Options, db string) (*Client, error) {
-	client := &Client{options: options}
-	if options.Github != nil {
-		tracker, err := github.New(options.Github)
+func New(options *Options, db string) (Client, error) {
+	client := &ReportingClient{options: options}
+
+	if options.GitHub != nil {
+		options.GitHub.HttpClient = options.HttpClient
+		tracker, err := github.New(options.GitHub)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not create reporting client")
+			return nil, errorutil.NewWithErr(err).Wrap(ErrReportingClientCreation)
 		}
 		client.trackers = append(client.trackers, tracker)
 	}
-	if options.Gitlab != nil {
-		tracker, err := gitlab.New(options.Gitlab)
+	if options.GitLab != nil {
+		options.GitLab.HttpClient = options.HttpClient
+		tracker, err := gitlab.New(options.GitLab)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not create reporting client")
+			return nil, errorutil.NewWithErr(err).Wrap(ErrReportingClientCreation)
 		}
 		client.trackers = append(client.trackers, tracker)
 	}
 	if options.Jira != nil {
+		options.Jira.HttpClient = options.HttpClient
 		tracker, err := jira.New(options.Jira)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not create reporting client")
+			return nil, errorutil.NewWithErr(err).Wrap(ErrReportingClientCreation)
 		}
 		client.trackers = append(client.trackers, tracker)
 	}
-	if options.DiskExporter != nil {
-		exporter, err := disk.New(options.DiskExporter)
+	if options.MarkdownExporter != nil {
+		exporter, err := markdown.New(options.MarkdownExporter)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not create exporting client")
+			return nil, errorutil.NewWithErr(err).Wrap(ErrExportClientCreation)
 		}
 		client.exporters = append(client.exporters, exporter)
 	}
 	if options.SarifExporter != nil {
 		exporter, err := sarif.New(options.SarifExporter)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not create exporting client")
+			return nil, errorutil.NewWithErr(err).Wrap(ErrExportClientCreation)
+		}
+		client.exporters = append(client.exporters, exporter)
+	}
+	if options.JSONExporter != nil {
+		exporter, err := json_exporter.New(options.JSONExporter)
+		if err != nil {
+			return nil, errorutil.NewWithErr(err).Wrap(ErrExportClientCreation)
+		}
+		client.exporters = append(client.exporters, exporter)
+	}
+	if options.JSONLExporter != nil {
+		exporter, err := jsonl.New(options.JSONLExporter)
+		if err != nil {
+			return nil, errorutil.NewWithErr(err).Wrap(ErrExportClientCreation)
 		}
 		client.exporters = append(client.exporters, exporter)
 	}
 	if options.ElasticsearchExporter != nil {
+		options.ElasticsearchExporter.HttpClient = options.HttpClient
 		exporter, err := es.New(options.ElasticsearchExporter)
 		if err != nil {
-			return nil, errors.Wrap(err, "could not create exporting client")
+			return nil, errorutil.NewWithErr(err).Wrap(ErrExportClientCreation)
+		}
+		client.exporters = append(client.exporters, exporter)
+	}
+	if options.SplunkExporter != nil {
+		options.SplunkExporter.HttpClient = options.HttpClient
+		exporter, err := splunk.New(options.SplunkExporter)
+		if err != nil {
+			return nil, errorutil.NewWithErr(err).Wrap(ErrExportClientCreation)
 		}
 		client.exporters = append(client.exporters, exporter)
 	}
@@ -158,18 +174,50 @@ func New(options *Options, db string) (*Client, error) {
 	return client, nil
 }
 
+// CreateConfigIfNotExists creates report-config if it doesn't exists
+func CreateConfigIfNotExists() error {
+	reportingConfig := config.DefaultConfig.GetReportingConfigFilePath()
+
+	if fileutil.FileExists(reportingConfig) {
+		return nil
+	}
+	values := stringslice.StringSlice{Value: []string{}}
+
+	options := &Options{
+		AllowList:             &Filter{Tags: values},
+		DenyList:              &Filter{Tags: values},
+		GitHub:                &github.Options{},
+		GitLab:                &gitlab.Options{},
+		Jira:                  &jira.Options{},
+		MarkdownExporter:      &markdown.Options{},
+		SarifExporter:         &sarif.Options{},
+		ElasticsearchExporter: &es.Options{},
+		SplunkExporter:        &splunk.Options{},
+		JSONExporter:          &json_exporter.Options{},
+		JSONLExporter:         &jsonl.Options{},
+	}
+	reportingFile, err := os.Create(reportingConfig)
+	if err != nil {
+		return errorutil.NewWithErr(err).Msgf("could not create config file")
+	}
+	defer reportingFile.Close()
+
+	err = yaml.NewEncoder(reportingFile).Encode(options)
+	return err
+}
+
 // RegisterTracker registers a custom tracker to the reporter
-func (c *Client) RegisterTracker(tracker Tracker) {
+func (c *ReportingClient) RegisterTracker(tracker Tracker) {
 	c.trackers = append(c.trackers, tracker)
 }
 
 // RegisterExporter registers a custom exporter to the reporter
-func (c *Client) RegisterExporter(exporter Exporter) {
+func (c *ReportingClient) RegisterExporter(exporter Exporter) {
 	c.exporters = append(c.exporters, exporter)
 }
 
 // Close closes the issue tracker reporting client
-func (c *Client) Close() {
+func (c *ReportingClient) Close() {
 	c.dedupe.Close()
 	for _, exporter := range c.exporters {
 		exporter.Close()
@@ -177,7 +225,7 @@ func (c *Client) Close() {
 }
 
 // CreateIssue creates an issue in the tracker
-func (c *Client) CreateIssue(event *output.ResultEvent) error {
+func (c *ReportingClient) CreateIssue(event *output.ResultEvent) error {
 	if c.options.AllowList != nil && !c.options.AllowList.GetMatch(event) {
 		return nil
 	}
@@ -201,11 +249,10 @@ func (c *Client) CreateIssue(event *output.ResultEvent) error {
 	return err
 }
 
-func stringSliceContains(slice []string, item string) bool {
-	for _, i := range slice {
-		if strings.EqualFold(i, item) {
-			return true
-		}
-	}
-	return false
+func (c *ReportingClient) GetReportingOptions() *Options {
+	return c.options
+}
+
+func (c *ReportingClient) Clear() {
+	c.dedupe.Clear()
 }

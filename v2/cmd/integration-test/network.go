@@ -3,14 +3,18 @@ package main
 import (
 	"net"
 
-	"github.com/projectdiscovery/nuclei/v2/internal/testutils"
+	"github.com/projectdiscovery/nuclei/v2/pkg/testutils"
 )
 
 var networkTestcases = map[string]testutils.TestCase{
-	"network/basic.yaml":      &networkBasic{},
-	"network/hex.yaml":        &networkBasic{},
-	"network/multi-step.yaml": &networkMultiStep{},
+	"network/basic.yaml":          &networkBasic{},
+	"network/hex.yaml":            &networkBasic{},
+	"network/multi-step.yaml":     &networkMultiStep{},
+	"network/self-contained.yaml": &networkRequestSelContained{},
+	"network/variables.yaml":      &networkVariables{},
 }
+
+const defaultStaticPort = 5431
 
 type networkBasic struct{}
 
@@ -18,7 +22,7 @@ type networkBasic struct{}
 func (h *networkBasic) Execute(filePath string) error {
 	var routerErr error
 
-	ts := testutils.NewTCPServer(func(conn net.Conn) {
+	ts := testutils.NewTCPServer(nil, defaultStaticPort, func(conn net.Conn) {
 		defer conn.Close()
 
 		data := make([]byte, 4)
@@ -32,17 +36,15 @@ func (h *networkBasic) Execute(filePath string) error {
 	})
 	defer ts.Close()
 
-	results, err := testutils.RunNucleiAndGetResults(filePath, ts.URL, debug)
+	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, ts.URL, debug)
 	if err != nil {
 		return err
 	}
 	if routerErr != nil {
 		return routerErr
 	}
-	if len(results) != 1 {
-		return errIncorrectResultsCount(results)
-	}
-	return nil
+
+	return expectResultsCount(results, 1)
 }
 
 type networkMultiStep struct{}
@@ -51,7 +53,7 @@ type networkMultiStep struct{}
 func (h *networkMultiStep) Execute(filePath string) error {
 	var routerErr error
 
-	ts := testutils.NewTCPServer(func(conn net.Conn) {
+	ts := testutils.NewTCPServer(nil, defaultStaticPort, func(conn net.Conn) {
 		defer conn.Close()
 
 		data := make([]byte, 5)
@@ -75,15 +77,69 @@ func (h *networkMultiStep) Execute(filePath string) error {
 	})
 	defer ts.Close()
 
-	results, err := testutils.RunNucleiAndGetResults(filePath, ts.URL, debug)
+	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, ts.URL, debug)
 	if err != nil {
 		return err
 	}
 	if routerErr != nil {
 		return routerErr
 	}
-	if len(results) != 1 {
-		return errIncorrectResultsCount(results)
+
+	var expectedResultsSize int
+	if debug {
+		expectedResultsSize = 3
+	} else {
+		expectedResultsSize = 1
 	}
-	return nil
+
+	return expectResultsCount(results, expectedResultsSize)
+}
+
+type networkRequestSelContained struct{}
+
+// Execute executes a test case and returns an error if occurred
+func (h *networkRequestSelContained) Execute(filePath string) error {
+	ts := testutils.NewTCPServer(nil, defaultStaticPort, func(conn net.Conn) {
+		defer conn.Close()
+
+		_, _ = conn.Write([]byte("Authentication successful"))
+	})
+	defer ts.Close()
+	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, "", debug)
+	if err != nil {
+		return err
+	}
+
+	return expectResultsCount(results, 1)
+}
+
+type networkVariables struct{}
+
+// Execute executes a test case and returns an error if occurred
+func (h *networkVariables) Execute(filePath string) error {
+	var routerErr error
+
+	ts := testutils.NewTCPServer(nil, defaultStaticPort, func(conn net.Conn) {
+		defer conn.Close()
+
+		data := make([]byte, 4)
+		if _, err := conn.Read(data); err != nil {
+			routerErr = err
+			return
+		}
+		if string(data) == "PING" {
+			_, _ = conn.Write([]byte("aGVsbG8="))
+		}
+	})
+	defer ts.Close()
+
+	results, err := testutils.RunNucleiTemplateAndGetResults(filePath, ts.URL, debug)
+	if err != nil {
+		return err
+	}
+	if routerErr != nil {
+		return routerErr
+	}
+
+	return expectResultsCount(results, 1)
 }

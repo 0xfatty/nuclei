@@ -3,215 +3,285 @@ package interactsh
 import (
 	"bytes"
 	"fmt"
-	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/karlseguin/ccache"
-	"github.com/pkg/errors"
+	"errors"
+
+	"github.com/Mzack9999/gcache"
 
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/interactsh/pkg/client"
 	"github.com/projectdiscovery/interactsh/pkg/server"
 	"github.com/projectdiscovery/nuclei/v2/pkg/operators"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
-	"github.com/projectdiscovery/nuclei/v2/pkg/progress"
-	"github.com/projectdiscovery/nuclei/v2/pkg/reporting"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/helpers/responsehighlighter"
+	"github.com/projectdiscovery/nuclei/v2/pkg/protocols/common/helpers/writer"
+	errorutil "github.com/projectdiscovery/utils/errors"
+	stringsutil "github.com/projectdiscovery/utils/strings"
 )
 
 // Client is a wrapped client for interactsh server.
 type Client struct {
-	dotHostname string
+	sync.Once
+	sync.RWMutex
+
+	options *Options
+
 	// interactsh is a client for interactsh server.
 	interactsh *client.Client
 	// requests is a stored cache for interactsh-url->request-event data.
-	requests *ccache.Cache
+	requests gcache.Cache[string, *RequestData]
 	// interactions is a stored cache for interactsh-interaction->interactsh-url data
-	interactions *ccache.Cache
+	interactions gcache.Cache[string, []*server.Interaction]
+	// matchedTemplates is a stored cache to track matched templates
+	matchedTemplates gcache.Cache[string, bool]
+	// interactshURLs is a stored cache to track multiple interactsh markers
+	interactshURLs gcache.Cache[string, string]
 
-	options          *Options
 	eviction         time.Duration
 	pollDuration     time.Duration
 	cooldownDuration time.Duration
 
-	firstTimeGroup sync.Once
-	generated      uint32 // decide to wait if we have a generated url
-	matched        bool
+	hostname string
+
+	// determines if wait the cooldown period in case of generated URL
+	generated atomic.Bool
+	matched   atomic.Bool
 }
-
-var (
-	defaultInteractionDuration = 60 * time.Second
-	interactshURLMarker        = "{{interactsh-url}}"
-)
-
-// Options contains configuration options for interactsh nuclei integration.
-type Options struct {
-	// ServerURL is the URL of the interactsh server.
-	ServerURL string
-	// Authorization is the Authorization header value
-	Authorization string
-	// CacheSize is the numbers of requests to keep track of at a time.
-	// Older items are discarded in LRU manner in favor of new requests.
-	CacheSize int64
-	// Eviction is the period of time after which to automatically discard
-	// interaction requests.
-	Eviction time.Duration
-	// CooldownPeriod is additional time to wait for interactions after closing
-	// of the poller.
-	ColldownPeriod time.Duration
-	// PollDuration is the time to wait before each poll to the server for interactions.
-	PollDuration time.Duration
-	// Output is the output writer for nuclei
-	Output output.Writer
-	// IssuesClient is a client for issue exporting
-	IssuesClient *reporting.Client
-	// Progress is the nuclei progress bar implementation.
-	Progress progress.Progress
-	// Debug specifies whether debugging output should be shown for interactsh-client
-	Debug bool
-}
-
-const defaultMaxInteractionsCount = 5000
 
 // New returns a new interactsh server client
 func New(options *Options) (*Client, error) {
-	parsed, err := url.Parse(options.ServerURL)
-	if err != nil {
-		return nil, errors.Wrap(err, "could not parse server url")
-	}
-
-	configure := ccache.Configure()
-	configure = configure.MaxSize(options.CacheSize)
-	cache := ccache.New(configure)
-
-	interactionsCfg := ccache.Configure()
-	interactionsCfg = interactionsCfg.MaxSize(defaultMaxInteractionsCount)
-	interactionsCache := ccache.New(interactionsCfg)
+	requestsCache := gcache.New[string, *RequestData](options.CacheSize).LRU().Build()
+	interactionsCache := gcache.New[string, []*server.Interaction](defaultMaxInteractionsCount).LRU().Build()
+	matchedTemplateCache := gcache.New[string, bool](defaultMaxInteractionsCount).LRU().Build()
+	interactshURLCache := gcache.New[string, string](defaultMaxInteractionsCount).LRU().Build()
 
 	interactClient := &Client{
 		eviction:         options.Eviction,
 		interactions:     interactionsCache,
-		dotHostname:      "." + parsed.Host,
+		matchedTemplates: matchedTemplateCache,
+		interactshURLs:   interactshURLCache,
 		options:          options,
-		requests:         cache,
+		requests:         requestsCache,
 		pollDuration:     options.PollDuration,
-		cooldownDuration: options.ColldownPeriod,
+		cooldownDuration: options.CooldownPeriod,
 	}
 	return interactClient, nil
 }
 
-func (c *Client) firstTimeInitializeClient() error {
+func (c *Client) poll() error {
+	if c.options.NoInteractsh {
+		// do not init if disabled
+		return ErrInteractshClientNotInitialized
+	}
 	interactsh, err := client.New(&client.Options{
-		ServerURL:         c.options.ServerURL,
-		Token:             c.options.Authorization,
-		PersistentSession: false,
+		ServerURL:           c.options.ServerURL,
+		Token:               c.options.Authorization,
+		DisableHTTPFallback: c.options.DisableHttpFallback,
+		HTTPClient:          c.options.HTTPClient,
+		KeepAliveInterval:   time.Minute,
 	})
 	if err != nil {
-		return errors.Wrap(err, "could not create client")
+		return errorutil.NewWithErr(err).Msgf("could not create client")
 	}
+
 	c.interactsh = interactsh
 
-	interactsh.StartPolling(c.pollDuration, func(interaction *server.Interaction) {
-		if c.options.Debug {
-			debugPrintInteraction(interaction)
-		}
-		item := c.requests.Get(interaction.UniqueID)
-		if item == nil {
+	interactURL := interactsh.URL()
+	interactDomain := interactURL[strings.Index(interactURL, ".")+1:]
+	gologger.Info().Msgf("Using Interactsh Server: %s", interactDomain)
+
+	c.setHostname(interactDomain)
+
+	err = interactsh.StartPolling(c.pollDuration, func(interaction *server.Interaction) {
+		request, err := c.requests.Get(interaction.UniqueID)
+		if errors.Is(err, gcache.KeyNotFoundError) || request == nil {
 			// If we don't have any request for this ID, add it to temporary
 			// lru cache, so we can correlate when we get an add request.
-			gotItem := c.interactions.Get(interaction.UniqueID)
-			if gotItem == nil {
-				c.interactions.Set(interaction.UniqueID, []*server.Interaction{interaction}, defaultInteractionDuration)
-			} else if items, ok := gotItem.Value().([]*server.Interaction); ok {
+			items, err := c.interactions.Get(interaction.UniqueID)
+			if errorutil.IsAny(err, gcache.KeyNotFoundError) || items == nil {
+				_ = c.interactions.SetWithExpire(interaction.UniqueID, []*server.Interaction{interaction}, defaultInteractionDuration)
+			} else {
 				items = append(items, interaction)
-				c.interactions.Set(interaction.UniqueID, items, defaultInteractionDuration)
+				_ = c.interactions.SetWithExpire(interaction.UniqueID, items, defaultInteractionDuration)
 			}
 			return
 		}
-		request, ok := item.Value().(*RequestData)
-		if !ok {
-			return
+
+		if requestShouldStopAtFirstMatch(request) || c.options.StopAtFirstMatch {
+			if gotItem, err := c.matchedTemplates.Get(hash(request.Event.InternalEvent)); gotItem && err == nil {
+				return
+			}
 		}
+
 		_ = c.processInteractionForRequest(interaction, request)
 	})
+
+	if err != nil {
+		return errorutil.NewWithErr(err).Msgf("could not perform interactsh polling")
+	}
 	return nil
+}
+
+// requestShouldStopAtFirstmatch checks if furthur interactions should be stopped
+// note: extra care should be taken while using this function since internalEvent is
+// synchronized all the time and if caller functions has already acquired lock its best to explicitly specify that
+// we could use `TryLock()` but that may over complicate things and need to differentiate
+// situations whether to block or skip
+func requestShouldStopAtFirstMatch(request *RequestData) bool {
+	request.Event.RLock()
+	defer request.Event.RUnlock()
+
+	if stop, ok := request.Event.InternalEvent[stopAtFirstMatchAttribute]; ok {
+		if v, ok := stop.(bool); ok {
+			return v
+		}
+	}
+	return false
 }
 
 // processInteractionForRequest processes an interaction for a request
 func (c *Client) processInteractionForRequest(interaction *server.Interaction, data *RequestData) bool {
+	data.Event.Lock()
 	data.Event.InternalEvent["interactsh_protocol"] = interaction.Protocol
 	data.Event.InternalEvent["interactsh_request"] = interaction.RawRequest
 	data.Event.InternalEvent["interactsh_response"] = interaction.RawResponse
-	result, matched := data.Operators.Execute(data.Event.InternalEvent, data.MatchFunc, data.ExtractFunc)
+	data.Event.InternalEvent["interactsh_ip"] = interaction.RemoteAddress
+	data.Event.Unlock()
+
+	result, matched := data.Operators.Execute(data.Event.InternalEvent, data.MatchFunc, data.ExtractFunc, c.options.Debug || c.options.DebugRequest || c.options.DebugResponse)
+
+	// if we don't match, return
 	if !matched || result == nil {
-		return false // if we don't match, return
+		return false
 	}
-	c.requests.Delete(interaction.UniqueID)
+	c.requests.Remove(interaction.UniqueID)
 
 	if data.Event.OperatorsResult != nil {
 		data.Event.OperatorsResult.Merge(result)
 	} else {
-		data.Event.OperatorsResult = result
+		data.Event.SetOperatorResult(result)
 	}
+
+	data.Event.Lock()
 	data.Event.Results = data.MakeResultFunc(data.Event)
+	for _, event := range data.Event.Results {
+		event.Interaction = interaction
+	}
+	data.Event.Unlock()
 
-	for _, result := range data.Event.Results {
-		result.Interaction = interaction
-		_ = c.options.Output.Write(result)
-		if !c.matched {
-			c.matched = true
-		}
-		c.options.Progress.IncrementMatched()
+	if c.options.Debug || c.options.DebugRequest || c.options.DebugResponse {
+		c.debugPrintInteraction(interaction, data.Event.OperatorsResult)
+	}
 
-		if c.options.IssuesClient != nil {
-			if err := c.options.IssuesClient.CreateIssue(result); err != nil {
-				gologger.Warning().Msgf("Could not create issue on tracker: %s", err)
-			}
+	if writer.WriteResult(data.Event, c.options.Output, c.options.Progress, c.options.IssuesClient) {
+		c.matched.Store(true)
+		if requestShouldStopAtFirstMatch(data) || c.options.StopAtFirstMatch {
+			_ = c.matchedTemplates.SetWithExpire(hash(data.Event.InternalEvent), true, defaultInteractionDuration)
 		}
 	}
+
 	return true
 }
 
-// URL returns a new URL that can be interacted with
-func (c *Client) URL() string {
-	c.firstTimeGroup.Do(func() {
-		if err := c.firstTimeInitializeClient(); err != nil {
-			gologger.Error().Msgf("Could not initialize interactsh client: %s", err)
-		}
-	})
-	if c.interactsh == nil {
-		return ""
-	}
-	atomic.CompareAndSwapUint32(&c.generated, 0, 1)
-	return c.interactsh.URL()
+func (c *Client) AlreadyMatched(data *RequestData) bool {
+	data.Event.RLock()
+	defer data.Event.RUnlock()
+
+	return c.matchedTemplates.Has(hash(data.Event.InternalEvent))
 }
 
-// Close closes the interactsh clients after waiting for cooldown period.
+// URL returns a new URL that can be interacted with
+func (c *Client) URL() (string, error) {
+	// first time initialization
+	var err error
+	c.Do(func() {
+		err = c.poll()
+	})
+	if err != nil {
+		return "", errorutil.NewWithErr(err).Wrap(ErrInteractshClientNotInitialized)
+	}
+
+	if c.interactsh == nil {
+		return "", ErrInteractshClientNotInitialized
+	}
+
+	c.generated.Store(true)
+	return c.interactsh.URL(), nil
+}
+
+// Close the interactsh clients after waiting for cooldown period.
 func (c *Client) Close() bool {
-	if c.cooldownDuration > 0 && atomic.LoadUint32(&c.generated) == 1 {
+	if c.cooldownDuration > 0 && c.generated.Load() {
 		time.Sleep(c.cooldownDuration)
 	}
 	if c.interactsh != nil {
-		c.interactsh.StopPolling()
+		_ = c.interactsh.StopPolling()
 		c.interactsh.Close()
 	}
-	return c.matched
+
+	c.requests.Purge()
+	c.interactions.Purge()
+	c.matchedTemplates.Purge()
+	c.interactshURLs.Purge()
+
+	return c.matched.Load()
 }
 
-// ReplaceMarkers replaces the {{interactsh-url}} placeholders to actual
-// URLs pointing to interactsh-server.
-//
-// It accepts data to replace as well as the URL to replace placeholders
-// with generated uniquely for each request.
-func (c *Client) ReplaceMarkers(data, interactshURL string) string {
-	if !strings.Contains(data, interactshURLMarker) {
-		return data
+// ReplaceMarkers replaces the default {{interactsh-url}} placeholders with interactsh urls
+func (c *Client) Replace(data string, interactshURLs []string) (string, []string) {
+	return c.ReplaceWithMarker(data, interactshURLMarkerRegex, interactshURLs)
+}
+
+// ReplaceMarkers replaces the placeholders with interactsh urls and appends them to interactshURLs
+func (c *Client) ReplaceWithMarker(data string, regex *regexp.Regexp, interactshURLs []string) (string, []string) {
+	for _, interactshURLMarker := range regex.FindAllString(data, -1) {
+		if url, err := c.NewURLWithData(interactshURLMarker); err == nil {
+			interactshURLs = append(interactshURLs, url)
+			data = strings.Replace(data, interactshURLMarker, url, 1)
+		}
 	}
-	replaced := strings.NewReplacer("{{interactsh-url}}", interactshURL).Replace(data)
-	return replaced
+	return data, interactshURLs
+}
+
+func (c *Client) NewURL() (string, error) {
+	return c.NewURLWithData("")
+}
+
+func (c *Client) NewURLWithData(data string) (string, error) {
+	url, err := c.URL()
+	if err != nil {
+		return "", err
+	}
+	if url == "" {
+		return "", errors.New("empty interactsh url")
+	}
+	_ = c.interactshURLs.SetWithExpire(url, data, defaultInteractionDuration)
+	return url, nil
+}
+
+// MakePlaceholders does placeholders for interact URLs and other data to a map
+func (c *Client) MakePlaceholders(urls []string, data map[string]interface{}) {
+	data["interactsh-server"] = c.getHostname()
+	for _, url := range urls {
+		if interactshURLMarker, err := c.interactshURLs.Get(url); interactshURLMarker != "" && err == nil {
+			interactshMarker := strings.TrimSuffix(strings.TrimPrefix(interactshURLMarker, "{{"), "}}")
+
+			c.interactshURLs.Remove(url)
+
+			data[interactshMarker] = url
+			urlIndex := strings.Index(url, ".")
+			if urlIndex == -1 {
+				continue
+			}
+			data[strings.Replace(interactshMarker, "url", "id", 1)] = url[:urlIndex]
+		}
+	}
 }
 
 // MakeResultEventFunc is a result making function for nuclei
@@ -227,29 +297,28 @@ type RequestData struct {
 }
 
 // RequestEvent is the event for a network request sent by nuclei.
-func (c *Client) RequestEvent(interactshURL string, data *RequestData) {
-	id := strings.TrimSuffix(interactshURL, c.dotHostname)
+func (c *Client) RequestEvent(interactshURLs []string, data *RequestData) {
+	for _, interactshURL := range interactshURLs {
+		id := strings.TrimRight(strings.TrimSuffix(interactshURL, c.getHostname()), ".")
 
-	interaction := c.interactions.Get(id)
-	if interaction != nil {
-		// If we have previous interactions, get them and process them.
-		interactions, ok := interaction.Value().([]*server.Interaction)
-		if !ok {
-			c.requests.Set(id, data, c.eviction)
-			return
-		}
-		matched := false
-		for _, interaction := range interactions {
-			if c.processInteractionForRequest(interaction, data) {
-				matched = true
+		if requestShouldStopAtFirstMatch(data) || c.options.StopAtFirstMatch {
+			gotItem, err := c.matchedTemplates.Get(hash(data.Event.InternalEvent))
+			if gotItem && err == nil {
 				break
 			}
 		}
-		if matched {
-			c.interactions.Delete(id)
+
+		interactions, err := c.interactions.Get(id)
+		if interactions != nil && err == nil {
+			for _, interaction := range interactions {
+				if c.processInteractionForRequest(interaction, data) {
+					c.interactions.Remove(id)
+					break
+				}
+			}
+		} else {
+			_ = c.requests.SetWithExpire(id, data, c.eviction)
 		}
-	} else {
-		c.requests.Set(id, data, c.eviction)
 	}
 }
 
@@ -265,35 +334,86 @@ func HasMatchers(op *operators.Operators) bool {
 
 	for _, matcher := range op.Matchers {
 		for _, dsl := range matcher.DSL {
-			if strings.Contains(dsl, "interactsh") {
+			if stringsutil.ContainsAnyI(dsl, "interactsh") {
 				return true
 			}
 		}
-		if strings.HasPrefix(matcher.Part, "interactsh") {
+		if stringsutil.HasPrefixI(matcher.Part, "interactsh") {
 			return true
 		}
 	}
 	for _, matcher := range op.Extractors {
-		if strings.HasPrefix(matcher.Part, "interactsh") {
+		if stringsutil.HasPrefixI(matcher.Part, "interactsh") {
 			return true
 		}
 	}
 	return false
 }
 
-func debugPrintInteraction(interaction *server.Interaction) {
+// HasMarkers checks if the text contains interactsh markers
+func HasMarkers(data string) bool {
+	return interactshURLMarkerRegex.Match([]byte(data))
+}
+
+func (c *Client) debugPrintInteraction(interaction *server.Interaction, event *operators.Result) {
 	builder := &bytes.Buffer{}
 
 	switch interaction.Protocol {
 	case "dns":
-		builder.WriteString(fmt.Sprintf("[%s] Received DNS interaction (%s) from %s at %s", interaction.FullId, interaction.QType, interaction.RemoteAddress, interaction.Timestamp.Format("2006-01-02 15:04:05")))
-		builder.WriteString(fmt.Sprintf("\n-----------\nDNS Request\n-----------\n\n%s\n\n------------\nDNS Response\n------------\n\n%s\n\n", interaction.RawRequest, interaction.RawResponse))
+		builder.WriteString(formatInteractionHeader("DNS", interaction.FullId, interaction.RemoteAddress, interaction.Timestamp))
+		if c.options.DebugRequest || c.options.Debug {
+			builder.WriteString(formatInteractionMessage("DNS Request", interaction.RawRequest, event, c.options.NoColor))
+		}
+		if c.options.DebugResponse || c.options.Debug {
+			builder.WriteString(formatInteractionMessage("DNS Response", interaction.RawResponse, event, c.options.NoColor))
+		}
 	case "http":
-		builder.WriteString(fmt.Sprintf("[%s] Received HTTP interaction from %s at %s", interaction.FullId, interaction.RemoteAddress, interaction.Timestamp.Format("2006-01-02 15:04:05")))
-		builder.WriteString(fmt.Sprintf("\n------------\nHTTP Request\n------------\n\n%s\n\n-------------\nHTTP Response\n-------------\n\n%s\n\n", interaction.RawRequest, interaction.RawResponse))
+		builder.WriteString(formatInteractionHeader("HTTP", interaction.FullId, interaction.RemoteAddress, interaction.Timestamp))
+		if c.options.DebugRequest || c.options.Debug {
+			builder.WriteString(formatInteractionMessage("HTTP Request", interaction.RawRequest, event, c.options.NoColor))
+		}
+		if c.options.DebugResponse || c.options.Debug {
+			builder.WriteString(formatInteractionMessage("HTTP Response", interaction.RawResponse, event, c.options.NoColor))
+		}
 	case "smtp":
-		builder.WriteString(fmt.Sprintf("[%s] Received SMTP interaction from %s at %s", interaction.FullId, interaction.RemoteAddress, interaction.Timestamp.Format("2006-01-02 15:04:05")))
-		builder.WriteString(fmt.Sprintf("\n------------\nSMTP Interaction\n------------\n\n%s\n\n", interaction.RawRequest))
+		builder.WriteString(formatInteractionHeader("SMTP", interaction.FullId, interaction.RemoteAddress, interaction.Timestamp))
+		if c.options.DebugRequest || c.options.Debug || c.options.DebugResponse {
+			builder.WriteString(formatInteractionMessage("SMTP Interaction", interaction.RawRequest, event, c.options.NoColor))
+		}
+	case "ldap":
+		builder.WriteString(formatInteractionHeader("LDAP", interaction.FullId, interaction.RemoteAddress, interaction.Timestamp))
+		if c.options.DebugRequest || c.options.Debug || c.options.DebugResponse {
+			builder.WriteString(formatInteractionMessage("LDAP Interaction", interaction.RawRequest, event, c.options.NoColor))
+		}
 	}
 	fmt.Fprint(os.Stderr, builder.String())
+}
+
+func formatInteractionHeader(protocol, ID, address string, at time.Time) string {
+	return fmt.Sprintf("[%s] Received %s interaction from %s at %s", ID, protocol, address, at.Format("2006-01-02 15:04:05"))
+}
+
+func formatInteractionMessage(key, value string, event *operators.Result, noColor bool) string {
+	value = responsehighlighter.Highlight(event, value, noColor, false)
+	return fmt.Sprintf("\n------------\n%s\n------------\n\n%s\n\n", key, value)
+}
+
+func hash(internalEvent output.InternalEvent) string {
+	templateId := internalEvent[templateIdAttribute].(string)
+	host := internalEvent["host"].(string)
+	return fmt.Sprintf("%s:%s", templateId, host)
+}
+
+func (c *Client) getHostname() string {
+	c.RLock()
+	defer c.RUnlock()
+
+	return c.hostname
+}
+
+func (c *Client) setHostname(hostname string) {
+	c.Lock()
+	defer c.Unlock()
+
+	c.hostname = hostname
 }

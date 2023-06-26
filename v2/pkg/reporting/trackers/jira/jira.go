@@ -3,15 +3,18 @@ package jira
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"strings"
 
 	"github.com/andygrunwald/go-jira"
+	"github.com/trivago/tgo/tcontainer"
+
 	"github.com/projectdiscovery/gologger"
 	"github.com/projectdiscovery/nuclei/v2/pkg/catalog/config"
 	"github.com/projectdiscovery/nuclei/v2/pkg/output"
 	"github.com/projectdiscovery/nuclei/v2/pkg/reporting/format"
 	"github.com/projectdiscovery/nuclei/v2/pkg/types"
+	"github.com/projectdiscovery/retryablehttp-go"
 )
 
 // Integration is a client for an issue tracker integration
@@ -22,22 +25,33 @@ type Integration struct {
 
 // Options contains the configuration options for jira client
 type Options struct {
-	// Cloud value is set to true when Jira cloud is used
-	Cloud bool `yaml:"cloud"`
-	// UpdateExisting value if true, the existing opened issue is updated
-	UpdateExisting bool `yaml:"update-existing"`
+	// Cloud value (optional) is set to true when Jira cloud is used
+	Cloud bool `yaml:"cloud" json:"cloud"`
+	// UpdateExisting value (optional) if true, the existing opened issue is updated
+	UpdateExisting bool `yaml:"update-existing" json:"update_existing"`
 	// URL is the URL of the jira server
-	URL string `yaml:"url"`
+	URL string `yaml:"url" json:"url" validate:"required"`
 	// AccountID is the accountID of the jira user.
-	AccountID string `yaml:"account-id"`
+	AccountID string `yaml:"account-id" json:"account_id" validate:"required"`
 	// Email is the email of the user for jira instance
-	Email string `yaml:"email"`
+	Email string `yaml:"email" json:"email" validate:"required,email"`
 	// Token is the token for jira instance.
-	Token string `yaml:"token"`
+	Token string `yaml:"token" json:"token" validate:"required"`
 	// ProjectName is the name of the project.
-	ProjectName string `yaml:"project-name"`
-	// IssueType is the name of the created issue type
-	IssueType string `yaml:"issue-type"`
+	ProjectName string `yaml:"project-name" json:"project_name" validate:"required"`
+	// IssueType (optional) is the name of the created issue type
+	IssueType string `yaml:"issue-type" json:"issue_type"`
+	// SeverityAsLabel (optional) sends the severity as the label of the created
+	// issue.
+	SeverityAsLabel bool `yaml:"severity-as-label" json:"severity_as_label"`
+	// Severity (optional) is the severity of the issue.
+	Severity   []string              `yaml:"severity" json:"severity"`
+	HttpClient *retryablehttp.Client `yaml:"-" json:"-"`
+	// for each customfield specified in the configuration options
+	// we will create a map of customfield name to the value
+	// that will be used to create the issue
+	CustomFields map[string]interface{} `yaml:"custom-fields" json:"custom_fields"`
+	StatusNot    string                 `yaml:"status-not" json:"status_not"`
 }
 
 // New creates a new issue tracker integration client based on options.
@@ -50,6 +64,9 @@ func New(options *Options) (*Integration, error) {
 		Username: username,
 		Password: options.Token,
 	}
+	if options.HttpClient != nil {
+		tp.Transport = options.HttpClient.HTTPClient.Transport
+	}
 	jiraClient, err := jira.NewClient(tp.Client(), options.URL)
 	if err != nil {
 		return nil, err
@@ -60,11 +77,60 @@ func New(options *Options) (*Integration, error) {
 // CreateNewIssue creates a new issue in the tracker
 func (i *Integration) CreateNewIssue(event *output.ResultEvent) error {
 	summary := format.Summary(event)
-
+	labels := []string{}
+	severityLabel := fmt.Sprintf("Severity:%s", event.Info.SeverityHolder.Severity.String())
+	if i.options.SeverityAsLabel && severityLabel != "" {
+		labels = append(labels, severityLabel)
+	}
+	if label := i.options.IssueType; label != "" {
+		labels = append(labels, label)
+	}
+	// for each custom value, take the name of the custom field and
+	// set the value of the custom field to the value specified in the
+	// configuration options
+	customFields := tcontainer.NewMarshalMap()
+	for name, value := range i.options.CustomFields {
+		//customFields[name] = map[string]interface{}{"value": value}
+		if valueMap, ok := value.(map[interface{}]interface{}); ok {
+			// Iterate over nested map
+			for nestedName, nestedValue := range valueMap {
+				fmtNestedValue, ok := nestedValue.(string)
+				if !ok {
+					return fmt.Errorf(`couldn't iterate on nested item "%s": %s`, nestedName, nestedValue)
+				}
+				if strings.HasPrefix(fmtNestedValue, "$") {
+					nestedValue = strings.TrimPrefix(fmtNestedValue, "$")
+					switch nestedValue {
+					case "CVSSMetrics":
+						nestedValue = event.Info.Classification.CVSSMetrics
+					case "CVEID":
+						nestedValue = event.Info.Classification.CVEID
+					case "CWEID":
+						nestedValue = event.Info.Classification.CWEID
+					case "CVSSScore":
+						nestedValue = event.Info.Classification.CVSSScore
+					case "Host":
+						nestedValue = event.Host
+					case "Severity":
+						nestedValue = event.Info.SeverityHolder
+					case "Name":
+						nestedValue = event.Info.Name
+					}
+				}
+				switch nestedName {
+				case "id":
+					customFields[name] = map[string]interface{}{"id": nestedValue}
+				case "name":
+					customFields[name] = map[string]interface{}{"value": nestedValue}
+				case "freeform":
+					customFields[name] = nestedValue
+				}
+			}
+		}
+	}
 	fields := &jira.IssueFields{
-		Assignee:    &jira.User{AccountID: i.options.AccountID},
-		Reporter:    &jira.User{AccountID: i.options.AccountID},
 		Description: jiraFormatDescription(event),
+		Unknowns:    customFields,
 		Type:        jira.IssueType{Name: i.options.IssueType},
 		Project:     jira.Project{Key: i.options.ProjectName},
 		Summary:     summary,
@@ -77,6 +143,8 @@ func (i *Integration) CreateNewIssue(event *output.ResultEvent) error {
 			Type:        jira.IssueType{Name: i.options.IssueType},
 			Project:     jira.Project{Key: i.options.ProjectName},
 			Summary:     summary,
+			Labels:      labels,
+			Unknowns:    customFields,
 		}
 	}
 
@@ -87,10 +155,10 @@ func (i *Integration) CreateNewIssue(event *output.ResultEvent) error {
 	if err != nil {
 		var data string
 		if resp != nil && resp.Body != nil {
-			d, _ := ioutil.ReadAll(resp.Body)
+			d, _ := io.ReadAll(resp.Body)
 			data = string(d)
 		}
-		return fmt.Errorf("%s => %s", err, data)
+		return fmt.Errorf("%w => %s", err, data)
 	}
 	return nil
 }
@@ -114,7 +182,7 @@ func (i *Integration) CreateIssue(event *output.ResultEvent) error {
 // FindExistingIssue checks if the issue already exists and returns its ID
 func (i *Integration) FindExistingIssue(event *output.ResultEvent) (string, error) {
 	template := format.GetMatchedTemplate(event)
-	jql := fmt.Sprintf("summary ~ \"%s\" AND summary ~ \"%s\" AND status = \"Open\"", template, event.Host)
+	jql := fmt.Sprintf("summary ~ \"%s\" AND summary ~ \"%s\" AND status != \"%s\"", template, event.Host, i.options.StatusNot)
 
 	searchOptions := &jira.SearchOptions{
 		MaxResults: 1, // if any issue exists, then we won't create a new one
@@ -124,10 +192,10 @@ func (i *Integration) FindExistingIssue(event *output.ResultEvent) (string, erro
 	if err != nil {
 		var data string
 		if resp != nil && resp.Body != nil {
-			d, _ := ioutil.ReadAll(resp.Body)
+			d, _ := io.ReadAll(resp.Body)
 			data = string(d)
 		}
-		return "", fmt.Errorf("%s => %s", err, data)
+		return "", fmt.Errorf("%w => %s", err, data)
 	}
 
 	switch resp.Total {
@@ -166,9 +234,7 @@ func jiraFormatDescription(event *output.ResultEvent) string { // TODO remove th
 	builder.WriteString("\n\n*Template Information*\n\n| Key | Value |\n")
 	builder.WriteString(format.ToMarkdownTableString(&event.Info))
 
-	builder.WriteString("\n*Request*\n\n{code}\n")
-	builder.WriteString(event.Request)
-	builder.WriteString("\n{code}\n")
+	builder.WriteString(createMarkdownCodeBlock("Request", event.Request))
 
 	builder.WriteString("\n*Response*\n\n{code}\n")
 	// If the response is larger than 5 kb, truncate it before writing.
@@ -217,14 +283,10 @@ func jiraFormatDescription(event *output.ResultEvent) string { // TODO remove th
 		builder.WriteString(event.Interaction.UniqueID)
 
 		if event.Interaction.RawRequest != "" {
-			builder.WriteString("\n\n*Interaction Request*\n\n{code}\n")
-			builder.WriteString(event.Interaction.RawRequest)
-			builder.WriteString("\n{code}\n")
+			builder.WriteString(createMarkdownCodeBlock("Interaction Request", event.Interaction.RawRequest))
 		}
 		if event.Interaction.RawResponse != "" {
-			builder.WriteString("\n*Interaction Response*\n\n{code}\n")
-			builder.WriteString(event.Interaction.RawResponse)
-			builder.WriteString("\n{code}\n")
+			builder.WriteString(createMarkdownCodeBlock("Interaction Response", event.Interaction.RawResponse))
 		}
 	}
 
@@ -241,7 +303,22 @@ func jiraFormatDescription(event *output.ResultEvent) string { // TODO remove th
 			}
 		}
 	}
-	builder.WriteString(fmt.Sprintf("\n---\nGenerated by [Nuclei v%s](https://github.com/projectdiscovery/nuclei)", config.Version))
+	builder.WriteString("\n")
+
+	if event.CURLCommand != "" {
+		builder.WriteString("\n*CURL Command*\n{code}\n")
+		builder.WriteString(event.CURLCommand)
+		builder.WriteString("\n{code}")
+	}
+	builder.WriteString(fmt.Sprintf("\n---\nGenerated by [Nuclei %s](https://github.com/projectdiscovery/nuclei)", config.Version))
 	data := builder.String()
 	return data
+}
+
+func createMarkdownCodeBlock(title string, content string) string {
+	return "\n" + createBoldMarkdown(title) + "\n" + content + "*\n\n{code}"
+}
+
+func createBoldMarkdown(value string) string {
+	return "*" + value + "*\n\n{code}"
 }
